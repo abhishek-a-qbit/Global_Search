@@ -1,0 +1,177 @@
+"""Query understanding + grouped retrieval on top of Typesense."""
+import re
+
+import requests
+
+from config import ALIAS, BASE, HEADERS, TS_URL
+from textutil import norm
+
+MIN_CHARS = 2
+_session = requests.Session()
+
+SECTION_LABELS = {
+    "products": "Products",
+    "news": "News",
+    "customer_story": "Customer stories",
+    "compare": "Comparisons",
+    "category": "Categories",
+}
+
+
+def msearch(searches: list[dict]) -> list[list[dict]]:
+    r = _session.post(
+        f"{TS_URL}/multi_search", headers=HEADERS, timeout=10,
+        json={"searches": [{"collection": ALIAS, **s} for s in searches]},
+    )
+    r.raise_for_status()
+    out = []
+    for res in r.json()["results"]:
+        if "error" in res:
+            raise RuntimeError(res["error"])
+        out.append([h["document"] for h in res["hits"]])
+    return out
+
+
+# ---- intent parsing ---------------------------------------------------------
+INTENT_PHRASES = {
+    "news": ["news", "press", "announcements"],
+    "customer_story": ["story", "stories", "customer story", "customer stories",
+                       "case study", "case studies"],
+}
+COMPARE_WORDS = {"vs", "versus"}
+
+
+def match_intent(tail: str):
+    if len(tail) < 2:
+        return None
+    for intent, phrases in INTENT_PHRASES.items():
+        if any(ph.startswith(tail) for ph in phrases):     # prefix match => works while typing
+            return intent
+    return None
+
+
+def parse(q: str) -> dict:
+    toks = norm(q).split()
+    for i, t in enumerate(toks):
+        if t in COMPARE_WORDS and i > 0:
+            return {"intent": "compare", "entity": " ".join(toks[:i]), "entity2": " ".join(toks[i + 1:])}
+    for n in (2, 1):
+        if len(toks) > n:
+            intent = match_intent(" ".join(toks[-n:]))
+            if intent:
+                return {"intent": intent, "entity": " ".join(toks[:-n]), "entity2": ""}
+    return {"intent": None, "entity": " ".join(toks), "entity2": ""}
+
+
+# ---- stage 1: resolve the product ------------------------------------------
+def _product_query(nq: str, typos: int) -> dict:
+    return dict(
+        q=nq, query_by="product_names", filter_by="type:=product", prefix=True,
+        num_typos=typos, drop_tokens_threshold=0, prioritize_exact_match=True,
+        prioritize_token_position=True,
+        sort_by="_text_match(buckets: 3):desc,name_len:asc,popularity:desc",
+        per_page=10,
+    )
+
+
+def search_products(text: str) -> list[dict]:
+    nq = norm(text)
+    if len(nq) < MIN_CHARS:
+        return []
+    hits = msearch([_product_query(nq, 0)])[0]
+    if not hits and len(nq) >= 4:                  # typo fallback only when nothing matches
+        hits = msearch([_product_query(nq, 1)])[0]
+    return hits
+
+
+def pick_anchor(text: str, hits: list[dict]):
+    """Returns (doc, rule). Rules: exact | parent | dominant | ambiguous | none."""
+    nq = norm(text)
+    if not hits:
+        return None, "none"
+    names = [norm(h["product_names"][0]) for h in hits]
+    for h, n in zip(hits, names):                  # 1. exact name
+        if n == nq:
+            return h, "exact"
+    first_words = {n.split()[0] for n in names}
+    if len(hits) > 1 and len(first_words) == 1:    # 2. a "parent" product named by the shared first word
+        fw = next(iter(first_words))
+        for h, n in zip(hits, names):
+            if n == fw:
+                return h, "parent"
+    if len(nq) >= 3:                               # 3. clear popularity winner
+        p0 = hits[0]["popularity"]
+        p1 = hits[1]["popularity"] if len(hits) > 1 else 0
+        if len(hits) == 1 or p0 >= 3 * max(p1, 1):
+            return hits[0], "dominant"
+    return None, "ambiguous"                       # 4. show a product list only
+
+
+# ---- stage 2: grouped results ----------------------------------------------
+def _item(d: dict) -> dict:
+    return {"title": d["title"], "path": d["path"], "url": BASE + d["path"], "type": d["type"]}
+
+
+def run(q: str) -> dict:
+    nq = norm(q)
+    if len(nq) < MIN_CHARS:
+        return {"query": q, "rule": "too_short", "anchor": None, "intent": None, "sections": []}
+
+    p = parse(q)
+    hits = search_products(p["entity"])
+    anchor, rule = pick_anchor(p["entity"], hits)
+    if p["intent"] and anchor is None:             # intent words only count after a confident anchor
+        p = {"intent": None, "entity": nq, "entity2": ""}
+        hits = search_products(nq)
+        anchor, rule = pick_anchor(nq, hits)
+
+    searches, keys = [], []
+    aid = None
+    if anchor:
+        aid = anchor["product_ids"][0]
+        searches += [
+            dict(q="*", filter_by=f"type:=news && product_ids:={aid}", per_page=1),
+            dict(q="*", filter_by=f"type:=customer_story && product_ids:={aid}", per_page=1),
+            dict(q="*", filter_by=f"type:=compare && product_ids:={aid}",
+                 sort_by="popularity:desc", per_page=250),
+        ]
+        keys += ["news", "customer_story", "compare"]
+    if not p["intent"] and len(nq) >= 3:
+        searches.append(dict(q=nq, query_by="title", filter_by="type:=category",
+                             prefix=True, num_typos=0, per_page=2))
+        keys.append("category")
+    got = dict(zip(keys, msearch(searches))) if searches else {}
+
+    if "compare" in got:
+        cdocs = got["compare"]
+        if p["intent"] == "compare" and p["entity2"]:   # filter on the OTHER product's name
+            e2 = p["entity2"]
+
+            def other(d):
+                k = d["product_ids"].index(aid)
+                return norm(d["product_names"][1 - k])
+
+            cdocs = [d for d in cdocs if re.search(r"(^| )" + re.escape(e2), other(d))]
+        got["compare"] = cdocs[:5]
+
+    prods = ([anchor] + [h for h in hits if h["id"] != anchor["id"]])[:3] if anchor else hits[:5]
+    sections = {"products": prods, **got}
+
+    order = ["products", "news", "customer_story", "compare", "category"]
+    if p["intent"]:
+        order.remove(p["intent"])
+        order.insert(0, p["intent"])
+    if any(norm(c["title"]) == nq for c in got.get("category", [])):
+        order.remove("category")
+        order.insert(0, "category")
+
+    return {
+        "query": q,
+        "rule": rule,
+        "intent": p["intent"],
+        "anchor": anchor["title"] if anchor else None,
+        "sections": [
+            {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]]}
+            for k in order if sections.get(k)
+        ],
+    }

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cuspera search demo</title>
+<style>
+  :root { --bg:#f7f7f8; --card:#fff; --text:#1c1c1e; --muted:#6b6b72; --line:#e4e4e8; --accent:#4f46e5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141417; --card:#1d1d21; --text:#ececef; --muted:#9a9aa3; --line:#2c2c32; --accent:#818cf8; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  main { max-width:720px; margin:48px auto; padding:0 16px; }
+  h1 { font-size:20px; margin:0 0 16px; }
+  input { width:100%; padding:14px 16px; font-size:17px; border:1px solid var(--line);
+          border-radius:12px; background:var(--card); color:var(--text); outline:none; }
+  input:focus { border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+  .chips { margin:10px 0 4px; display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { border:1px solid var(--line); background:var(--card); color:var(--muted); border-radius:999px;
+          padding:3px 10px; font-size:13px; cursor:pointer; }
+  .chip:hover { color:var(--text); border-color:var(--accent); }
+  .meta { color:var(--muted); font-size:13px; margin:10px 2px; min-height:18px; }
+  .meta b { color:var(--text); font-weight:600; }
+  .section { background:var(--card); border:1px solid var(--line); border-radius:12px; margin:12px 0; overflow:hidden; }
+  .section h2 { font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
+                margin:0; padding:10px 14px; border-bottom:1px solid var(--line); }
+  .item { display:block; padding:10px 14px; text-decoration:none; color:inherit; border-bottom:1px solid var(--line); }
+  .item:last-child { border-bottom:0; }
+  .item:hover { background:color-mix(in srgb, var(--accent) 8%, transparent); }
+  .title { font-weight:600; }
+  .path { color:var(--muted); font-size:12.5px; word-break:break-all; }
+  .empty { color:var(--muted); padding:24px 4px; text-align:center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Cuspera global search <span style="color:var(--muted);font-weight:400">(demo)</span></h1>
+  <input id="q" type="search" placeholder="Try: 6sense, algolia news, canva vs fi, crm" autofocus autocomplete="off">
+  <div class="chips" id="chips"></div>
+  <div class="meta" id="meta"></div>
+  <div id="results"></div>
+</main>
+
+<script>
+const EXAMPLES = ["6s", "6sense", "6sense news", "algoli", "algolia", "algolia ne",
+                  "algolia customer story", "canva vs fi", "figma vs ca", "crm", "adob"];
+const $q = document.getElementById("q");
+const $meta = document.getElementById("meta");
+const $results = document.getElementById("results");
+
+document.getElementById("chips").append(...EXAMPLES.map(t => {
+  const b = document.createElement("button");
+  b.className = "chip"; b.textContent = t;
+  b.onclick = () => { $q.value = t; search(t); $q.focus(); };
+  return b;
+}));
+
+let timer, controller;
+$q.addEventListener("input", () => {
+  clearTimeout(timer);
+  timer = setTimeout(() => search($q.value), 150);          // debounce
+});
+
+async function search(q) {
+  if (controller) controller.abort();                        // cancel stale request
+  if (q.trim().length < 2) { $meta.textContent = ""; $results.replaceChildren(); return; }
+  controller = new AbortController();
+  try {
+    const res = await fetch("/api/search?q=" + encodeURIComponent(q), { signal: controller.signal });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    render(await res.json());
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    $meta.textContent = ""; $results.replaceChildren(el("div", "empty", "Error: " + e.message));
+  }
+}
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+function render(data) {
+  const parts = [];
+  parts.push(data.anchor ? `anchor: <b>${esc(data.anchor)}</b> (${data.rule})` : `no confident product (${data.rule})`);
+  if (data.intent) parts.push(`intent: <b>${data.intent}</b>`);
+  parts.push(`${data.took_ms} ms`);
+  $meta.innerHTML = parts.join(" · ");
+
+  if (!data.sections.length) {
+    $results.replaceChildren(el("div", "empty", "No results"));
+    return;
+  }
+  $results.replaceChildren(...data.sections.map(sec => {
+    const box = el("div", "section");
+    box.append(el("h2", "", sec.label));
+    sec.items.forEach(it => {
+      const a = el("a", "item"); a.href = it.url; a.target = "_blank"; a.rel = "noopener";
+      a.append(el("div", "title", it.title), el("div", "path", it.path));
+      box.append(a);
+    });
+    return box;
+  }));
+}
+
+function esc(s) { return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+</script>
+</body>
+</html>
