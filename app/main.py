@@ -5,7 +5,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
-import search
+from scripts import search
 from config import HEADERS, TS_URL
 
 app = FastAPI(title="Cuspera global search")
@@ -32,4 +32,8 @@ def api_search(q: str = Query("", max_length=200)):
 
 
 # Serve the frontend at /
-app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
+app.mount(
+    "/",
+    StaticFiles(directory=Path(__file__).resolve().parents[1] / "frontend", html=True),
+    name="static",
+)

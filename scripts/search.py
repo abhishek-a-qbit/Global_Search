@@ -4,7 +4,7 @@ import re
 import requests
 
 from config import ALIAS, BASE, HEADERS, TS_URL
-from textutil import norm
+from scripts.Textutil import norm
 
 MIN_CHARS = 2
 _session = requests.Session()
