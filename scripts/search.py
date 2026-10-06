@@ -1,14 +1,12 @@
 """Query understanding + grouped retrieval on top of Typesense."""
 import re
 
-import requests
-
-from config import ALIAS, BASE, HEADERS, TS_URL
+from config import ALIAS, BASE, make_client
 from scripts.Textutil import norm
 
 MIN_CHARS = 2
 MAX_SPLIT_TOKENS = 6
-_session = requests.Session()
+client = make_client(timeout_seconds=2)             # search-as-you-type: fail fast
 
 SECTION_LABELS = {
     "products": "Products",
@@ -22,13 +20,9 @@ SECTION_LABELS = {
 def msearch(searches: list[dict]) -> list[list[dict]]:
     if not searches:
         return []
-    r = _session.post(
-        f"{TS_URL}/multi_search", headers=HEADERS, timeout=10,
-        json={"searches": [{"collection": ALIAS, **s} for s in searches]},
-    )
-    r.raise_for_status()
+    response = client.multi_search.perform({"searches": [{"collection": ALIAS, **s} for s in searches]})
     out = []
-    for res in r.json()["results"]:
+    for res in response["results"]:
         if "error" in res:
             raise RuntimeError(res["error"])
         out.append([h["document"] for h in res["hits"]])
@@ -136,7 +130,7 @@ def pick_anchor(text: str, hits: list[dict]):
         for h, n in zip(hits, names):
             if n == fw:
                 return h, "parent"
-    if len(nq) >= 3:                               # 3. clear popularity winner
+    if len(nq) >= 3 and names[0].startswith(nq):   # 3. clear popularity winner whose name starts with the query
         p0 = hits[0]["popularity"]
         p1 = hits[1]["popularity"] if len(hits) > 1 else 0
         if len(hits) == 1 or p0 >= 3 * max(p1, 1):

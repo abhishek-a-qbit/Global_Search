@@ -1,0 +1,6 @@
+# Docker Desktop on Windows (WSL kernel without /proc/self/io) only:
+#   docker compose -f docker-compose.yml -f docker-compose.wsl.yml up -d --build
+services:
+  typesense:
+    build: ./docker/wsl-procio-shim
+    image: typesense-wsl:30.2

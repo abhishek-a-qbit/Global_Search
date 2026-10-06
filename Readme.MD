@@ -1,32 +1,57 @@
 # Cuspera global search
 
-FastAPI serves the search API and the frontend. Typesense is the search engine and
-must be running separately; it can run without Docker under WSL 2 on Windows.
+FastAPI serves the search API and the frontend. The search engine is the official
+Typesense server (v30.2), accessed through the official `typesense` Python client
+(v2.0.0). Typesense runs locally on your machine (Docker or WSL); no cloud service
+is needed.
 
-## Run on Windows without Docker
+## Prerequisite on Windows: enable virtualization
 
-Install WSL 2 and Ubuntu if you do not already have them:
+Both Docker Desktop and WSL 2 need the Windows "Virtual Machine Platform". In an
+**administrator** PowerShell:
 
 ```powershell
-wsl --install -d Ubuntu
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
 ```
 
-Restart Windows if prompted. In Ubuntu (WSL), download and run Typesense:
+Restart Windows. If WSL still reports that virtualization is disabled, turn on
+Intel VT-x / AMD-V (SVM) in your BIOS/UEFI settings.
+
+## Run Typesense
+
+Option A, Docker, from the repository directory. On a normal Linux host:
 
 ```bash
-curl -O https://dl.typesense.org/releases/27.1/typesense-server-27.1-linux-amd64.tar.gz
-tar -xzf typesense-server-27.1-linux-amd64.tar.gz
+docker compose up -d
+```
+
+On Windows with Docker Desktop, newer WSL kernels (e.g. WSL 3.x, kernel 6.18) have
+no `/proc/self/io`, which makes `typesense-server` segfault at startup (exit code
+139, no logs). Use the dev override, which builds a small preload shim on top of
+the official image (`docker/wsl-procio-shim/`):
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.wsl.yml up -d --build
+```
+
+Option B, WSL (Ubuntu) without Docker:
+
+```bash
+curl -O https://dl.typesense.org/releases/30.2/typesense-server-30.2-linux-amd64.tar.gz
+tar -xzf typesense-server-30.2-linux-amd64.tar.gz
 mkdir -p ~/typesense-data
 ./typesense-server --data-dir="$HOME/typesense-data" --api-key=xyz --enable-cors
 ```
 
-Keep that Ubuntu terminal open while using the app. These commands follow the
-[official Typesense Linux binary instructions](https://typesense.org/docs/guide/install-typesense.html).
-
 WSL normally forwards port `8108` to Windows `localhost`. If that does not
 work, get the WSL IP with `wsl hostname -I` and set
-`$env:TYPESENSE_URL = "http://<WSL-IP>:8108"` in the PowerShell window before
-running the indexer and app below.
+`$env:TYPESENSE_URL = "http://<WSL-IP>:8108"` before running the indexer and app.
+
+For anything beyond local development, set a strong `TYPESENSE_API_KEY`
+environment variable for both Typesense and the app instead of `xyz`.
+
+## Index and run the app
 
 In PowerShell, from the repository directory:
 
@@ -40,8 +65,9 @@ py -m venv .venv
 
 Open <http://localhost:8000>. The first indexing run downloads the configured
 sitemaps and may take some time. It builds a new collection and switches the
-search alias after a successful import. Keep the terminal running while using
-the app. In a second PowerShell window, you can check Typesense with:
+search alias after a successful import, then deletes older build collections.
+Re-run `indexer.py` whenever you want to refresh the data. Keep the terminal
+running while using the app. In a second PowerShell window, you can check Typesense with:
 
 ```powershell
 Invoke-RestMethod http://localhost:8108/health
