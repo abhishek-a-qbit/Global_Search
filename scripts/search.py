@@ -249,6 +249,9 @@ def interpret(nq: str) -> dict:
         a, r, h = anchor(lead_entity)
         if a:
             return {"intent": "compare", "anchor": a, "rule": r, "hits": h}
+    if intent and not hits0:                        # 'news cr': no confident product yet, list candidates
+        a, r, h = anchor(" ".join(rest))
+        return {"intent": None, "anchor": None, "rule": r, "hits": h}
     return plain
 
 
@@ -272,11 +275,10 @@ def run(q: str) -> dict:
     searches, keys = [], []
     if anchor:
         aid = anchor["product_ids"][0]
-        searches += [
-            dict(q="*", filter_by=f"type:=news && product_ids:={aid}", per_page=1),
-            dict(q="*", filter_by=f"type:=customer_story && product_ids:={aid}", per_page=1),
-        ]
-        keys += ["news", "customer_story"]
+        for i, pid in enumerate([aid] + ([b["product_ids"][0]] if b else [])):   # group info for both products
+            for kind in ("news", "customer_story"):
+                searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={pid}", per_page=1))
+                keys.append(f"{kind}_{i}")
         if not p.get("e2"):
             searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={aid}",
                                  sort_by="popularity:desc", per_page=5))
@@ -291,6 +293,8 @@ def run(q: str) -> dict:
                              prefix=True, num_typos=0, per_page=2))
         keys.append("category")
     got = dict(zip(keys, msearch(searches)))
+    for kind in ("news", "customer_story"):
+        got[kind] = got.pop(f"{kind}_0", []) + got.pop(f"{kind}_1", [])
 
     if p.get("e2"):
         if p["pair"] or not b:
