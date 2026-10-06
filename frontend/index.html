@@ -44,8 +44,8 @@
 </main>
 
 <script>
-const EXAMPLES = ["6s", "6sense", "6sense news", "algoli", "algolia", "algolia ne",
-                  "algolia customer story", "canva vs fi", "figma vs ca", "crm", "adob"];
+const EXAMPLES = ["6s", "6sense", "6sense news", "news 6sense", "algoli", "algolia", "algolia ne",
+                  "algolia customer story", "canva vs fi", "canva figma", "figma and canva", "crm", "adob"];
 const $q = document.getElementById("q");
 const $meta = document.getElementById("meta");
 const $results = document.getElementById("results");
@@ -87,6 +87,7 @@ function el(tag, cls, text) {
 function render(data) {
   const parts = [];
   parts.push(data.anchor ? `anchor: <b>${esc(data.anchor)}</b> (${data.rule})` : `no confident product (${data.rule})`);
+  if (data.anchor2) parts.push(`vs <b>${esc(data.anchor2)}</b>`);
   if (data.intent) parts.push(`intent: <b>${data.intent}</b>`);
   parts.push(`${data.took_ms} ms`);
   $meta.innerHTML = parts.join(" · ");
