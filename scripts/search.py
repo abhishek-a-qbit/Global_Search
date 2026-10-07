@@ -6,6 +6,8 @@ from scripts.Textutil import norm
 
 MIN_CHARS = 2
 MAX_SPLIT_TOKENS = 6
+MAX_EXTRACT_TOKENS = 8
+MAX_SPAN_TOKENS = 4
 client = make_client(timeout_seconds=2)             # search-as-you-type: fail fast
 
 SECTION_LABELS = {
@@ -42,6 +44,7 @@ SOFT_SEPS = {"and", "or", "with"}                    # only count as compare if 
 COMPARE_LEADS = [("difference", "between"), ("differences", "between"),
                  ("compare",), ("comparing",), ("comparison",)]
 FILLER = {"about", "for", "of", "on", "from", "by", "the", "latest", "recent"}
+NON_ENTITY_WORDS = HARD_SEPS | SOFT_SEPS | FILLER | {w for p in COMPARE_LEADS for w in p} | {"compared", "to"}
 
 
 def match_intent(tail: str):
@@ -130,7 +133,8 @@ def pick_anchor(text: str, hits: list[dict]):
         for h, n in zip(hits, names):
             if n == fw:
                 return h, "parent"
-    if len(nq) >= 3 and names[0].startswith(nq):   # 3. clear popularity winner whose name starts with the query
+    mid_word = not names[0].startswith(nq) and any(t.startswith(nq) for t in names[0].split()[1:])
+    if len(nq) >= 3 and not mid_word:              # 3. clear popularity winner (not a later-word match like 'crm' -> 'C3 CRM')
         p0 = hits[0]["popularity"]
         p1 = hits[1]["popularity"] if len(hits) > 1 else 0
         if len(hits) == 1 or p0 >= 3 * max(p1, 1):
@@ -181,39 +185,60 @@ def interpret(nq: str) -> dict:
     if r0 == "exact" or any(norm(h["product_names"][0]).startswith(nq) for h in hits0):
         return plain                                # the whole query is (the start of) a real product name
 
-    # Compare candidates: anchor on a confident side, the other side filters its comparisons.
-    cands = []
-    for group, ltext, rtext, kind in pairs:
-        (la, lr, lh), (ra, rr, rh) = anchor(ltext), (anchor(rtext) if rtext else (None, "none", []))
-        if lr not in RULE_RANK and rr in RULE_RANK:
-            (la, lr, lh), (ra, rr, rh), ltext, rtext = (ra, rr, rh), (la, lr, lh), rtext, ltext
-        if lr not in RULE_RANK:
-            continue
-        if ra and ra["id"] == la["id"]:
-            ra, rr = None, "none"
-        cands.append({"group": group, "kind": kind, "anchor": la, "rule": lr, "hits": lh, "e2": rtext,
-                      "b": ra if rr in RULE_RANK else None, "b_rule": rr})
+    def evaluate(pairs):
+        """Compare candidates: anchor on a confident side, the other side filters its comparisons."""
+        cands = []
+        for group, ltext, rtext, kind in pairs:
+            (la, lr, lh), (ra, rr, rh) = anchor(ltext), (anchor(rtext) if rtext else (None, "none", []))
+            if lr not in RULE_RANK and rr in RULE_RANK:
+                (la, lr, lh), (ra, rr, rh), ltext, rtext = (ra, rr, rh), (la, lr, lh), rtext, ltext
+            if lr not in RULE_RANK:
+                continue
+            if ra and ra["id"] == la["id"]:
+                ra, rr = None, "none"
+            cands.append({"group": group, "kind": kind, "anchor": la, "rule": lr, "hits": lh, "e2": rtext,
+                          "b": ra if rr in RULE_RANK else None, "b_rule": rr})
 
-    searches = []
-    for c in cands:
-        c["e2q"] = norm(c["b"]["product_names"][0]) if c["b"] else c["e2"]
-        if c["e2q"]:
-            searches.append(dict(q=c["e2q"], query_by="product_names", prefix=True, num_typos=0,
-                                 filter_by=f"type:=compare && product_ids:={c['anchor']['product_ids'][0]}",
-                                 per_page=50))
-    partner_results = iter(msearch(searches))
-    for c in cands:
-        c["pair"], c["partners"] = [], []
-        if not c["e2q"]:
-            continue
-        aid = c["anchor"]["product_ids"][0]
-        bid = c["b"]["product_ids"][0] if c["b"] else None
-        pat = re.compile(("^" if c["kind"] == "bare" else r"(^| )") + re.escape(c["e2q"]))
-        for d in next(partner_results):
-            if bid is not None and bid in d["product_ids"]:
-                c["pair"].append(d)
-            elif pat.search(_other_name(d, aid)):
-                c["partners"].append(d)
+        searches = []
+        for c in cands:
+            c["e2q"] = norm(c["b"]["product_names"][0]) if c["b"] else c["e2"]
+            if c["e2q"]:
+                searches.append(dict(q=c["e2q"], query_by="product_names", prefix=True, num_typos=0,
+                                     filter_by=f"type:=compare && product_ids:={c['anchor']['product_ids'][0]}",
+                                     per_page=50))
+        partner_results = iter(msearch(searches))
+        for c in cands:
+            c["pair"], c["partners"] = [], []
+            if not c["e2q"]:
+                continue
+            aid = c["anchor"]["product_ids"][0]
+            bid = c["b"]["product_ids"][0] if c["b"] else None
+            pat = re.compile(("^" if c["kind"] == "bare" else r"(^| )") + re.escape(c["e2q"]))
+            for d in next(partner_results):
+                if bid is not None and bid in d["product_ids"]:
+                    c["pair"].append(d)
+                elif pat.search(_other_name(d, aid)):
+                    c["partners"].append(d)
+        return cands
+
+    def extract_products(ext_toks):
+        """Up to 2 confident product mentions anywhere in the query, skipping unmatched words."""
+        spans = [(i, j) for i in range(len(ext_toks))
+                 for j in range(i + 1, min(len(ext_toks), i + MAX_SPAN_TOKENS) + 1)]
+        texts = [" ".join(ext_toks[i:j]) for i, j in spans]
+        found.update(resolve_products([t for t in texts if t not in found]))
+        scored = sorted(((j - i, RULE_RANK[anchor(t)[1]], -i, i, j, t) for (i, j), t in zip(spans, texts)
+                         if anchor(t)[1] in RULE_RANK), reverse=True)    # longer span, stronger rule first
+        chosen = []
+        for *_, i, j, t in scored:
+            if all(j <= ci or i >= cj for ci, cj, _ in chosen) \
+                    and all(anchor(t)[0]["id"] != anchor(ct)[0]["id"] for _, _, ct in chosen):
+                chosen.append((i, j, t))
+            if len(chosen) == 2:
+                break
+        return [t for _, _, t in sorted(chosen)]
+
+    cands = evaluate(pairs)
 
     def valid(c):
         if c["kind"] == "hard":
@@ -243,6 +268,19 @@ def interpret(nq: str) -> dict:
         a, r, h = anchor(lead_entity)
         if a:
             return {"intent": "compare", "anchor": a, "rule": r, "hits": h}
+
+    # Last resort: 'algolia xqyz landingi' / 'landingi xqzw' -> find the product names among unmatched words.
+    ext_toks = [t for t in rest if t not in NON_ENTITY_WORDS]
+    if 2 <= len(ext_toks) <= MAX_EXTRACT_TOKENS:
+        mentions = extract_products(ext_toks)
+        if len(mentions) == 2:
+            c = evaluate([(3, mentions[0], mentions[1], "bare")])
+            if c:
+                return compare_result(c[0])
+        if len(mentions) == 1 and anchor(mentions[0])[1] in ("exact", "parent"):
+            a, r, h = anchor(mentions[0])
+            return {"intent": intent if ckind is None else "compare", "anchor": a, "rule": r, "hits": h}
+
     if intent and not hits0:                        # 'news cr': no confident product yet, list candidates
         a, r, h = anchor(" ".join(rest))
         return {"intent": None, "anchor": None, "rule": r, "hits": h}
@@ -273,7 +311,7 @@ def run(q: str) -> dict:
             for kind in ("news", "customer_story"):
                 searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={pid}", per_page=1))
                 keys.append(f"{kind}_{i}")
-        if not p.get("e2"):
+        if not p.get("e2") or not (b or p["pair"] or p["partners"]):   # nothing matched the 2nd side: show anchor's
             searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={aid}",
                                  sort_by="popularity:desc", per_page=5))
             keys.append("compare")
@@ -290,7 +328,7 @@ def run(q: str) -> dict:
     for kind in ("news", "customer_story"):
         got[kind] = got.pop(f"{kind}_0", []) + got.pop(f"{kind}_1", [])
 
-    if p.get("e2"):
+    if p.get("e2") and (b or p["pair"] or p["partners"]):
         if p["pair"] or not b:
             got["compare"] = (p["pair"] + p["partners"])[:5]
         else:
