@@ -16,15 +16,18 @@ client = make_client(timeout_seconds=120)            # bulk imports can be slow
 
 
 def sitemap_paths(url: str) -> list[str]:
+    """Page paths in a sitemap, following nested sitemap indexes."""
     response = SESSION.get(url, timeout=60)
     response.raise_for_status()
     root = ET.fromstring(response.content)
-    paths = [
-        urlsplit(element.text.strip()).path
+    locs = [
+        element.text.strip()
         for element in root.iter()
         if element.tag.endswith("loc") and element.text and urlsplit(element.text.strip()).netloc
     ]
-    return list(dict.fromkeys(paths))
+    if root.tag.endswith("sitemapindex"):
+        return list(dict.fromkeys(path for loc in locs for path in sitemap_paths(loc)))
+    return list(dict.fromkeys(urlsplit(loc).path for loc in locs))
 
 
 def _title(path: str) -> str:
@@ -34,9 +37,10 @@ def _title(path: str) -> str:
 
 def build_documents() -> list[dict]:
     paths_by_kind = {
-        kind: sitemap_paths(url)
-        for kind, url in SITEMAPS.items()
+        kind: list(dict.fromkeys(path for url in urls for path in sitemap_paths(url)))
+        for kind, urls in SITEMAPS.items()
     }
+    print(", ".join(f"{kind}: {len(paths)}" for kind, paths in paths_by_kind.items()))
 
     products_by_id = {}
     comparison_pairs = []
@@ -71,20 +75,23 @@ def build_documents() -> list[dict]:
             "popularity": 1 + comparison_counts.get(product_id, 0),
         })
 
+    product_page_suffix = {"news": "News", "customer_story": "Customer Stories", "alternatives": "Alternatives"}
     for sitemap_kind, document_type in (
         ("news", "news"),
         ("customer-story", "customer_story"),
+        ("alternatives", "alternatives"),
         ("categories", "category"),
+        ("industries", "industry"),
     ):
         for path in paths_by_kind[sitemap_kind]:
             path_hash = hashlib.sha1(path.encode("utf-8")).hexdigest()
-            product_match = re.search(r"/products/[^/]*-x-(\d+)/(?:news|customer-story)$", path)
+            product_match = re.search(r"/products/[^/]*-x-(\d+)/(?:news|customer-story|alternatives)$", path)
             product_id = int(product_match.group(1)) if product_match else None
             product = products_by_id.get(product_id) if product_id is not None else None
             product_ids = [product_id] if product else []
             product_names = [product["name"]] if product else []
             title = (
-                f"{product['name']} {('News' if document_type == 'news' else 'Customer Stories')}"
+                f"{product['name']} {product_page_suffix[document_type]}"
                 if product
                 else _title(path)
             )

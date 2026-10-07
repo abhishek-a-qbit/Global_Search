@@ -14,9 +14,13 @@ SECTION_LABELS = {
     "products": "Products",
     "news": "News",
     "customer_story": "Customer stories",
+    "alternatives": "Alternatives",
     "compare": "Comparisons",
     "category": "Categories",
+    "industry": "Industries",
 }
+PRODUCT_PAGE_TYPES = ("news", "customer_story", "alternatives")   # one page per product
+TOPIC_TYPES = ("category", "industry")                             # matched by title
 
 
 def msearch(searches: list[dict]) -> list[list[dict]]:
@@ -37,13 +41,14 @@ INTENT_PHRASES = {
     "customer_story": ["story", "stories", "customer story", "customer stories",
                        "case study", "case studies"],
     "compare": ["compare", "comparison", "comparisons"],
+    "alternatives": ["alternatives", "alternative", "competitors", "competitor"],
 }
 PHRASE_INTENT = {ph: intent for intent, phrases in INTENT_PHRASES.items() for ph in phrases}
 HARD_SEPS = {"vs", "versus", "v"}
 SOFT_SEPS = {"and", "or", "with"}                    # only count as compare if both sides check out
 COMPARE_LEADS = [("difference", "between"), ("differences", "between"),
                  ("compare",), ("comparing",), ("comparison",)]
-FILLER = {"about", "for", "of", "on", "from", "by", "the", "latest", "recent"}
+FILLER = {"about", "for", "of", "on", "from", "by", "to", "the", "latest", "recent", "top", "best"}
 NON_ENTITY_WORDS = HARD_SEPS | SOFT_SEPS | FILLER | {w for p in COMPARE_LEADS for w in p} | {"compared", "to"}
 
 
@@ -308,7 +313,7 @@ def run(q: str) -> dict:
     if anchor:
         aid = anchor["product_ids"][0]
         for i, pid in enumerate([aid] + ([b["product_ids"][0]] if b else [])):   # group info for both products
-            for kind in ("news", "customer_story"):
+            for kind in PRODUCT_PAGE_TYPES:
                 searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={pid}", per_page=1))
                 keys.append(f"{kind}_{i}")
         if not p.get("e2") or not (b or p["pair"] or p["partners"]):   # nothing matched the 2nd side: show anchor's
@@ -321,11 +326,12 @@ def run(q: str) -> dict:
                                      sort_by="popularity:desc", per_page=3))
                 keys.append(key)
     if not p["intent"] and len(nq) >= 3:
-        searches.append(dict(q=nq, query_by="title", filter_by="type:=category",
-                             prefix=True, num_typos=0, per_page=2))
-        keys.append("category")
+        for kind in TOPIC_TYPES:
+            searches.append(dict(q=nq, query_by="title", filter_by=f"type:={kind}",
+                                 prefix=True, num_typos=0, per_page=2))
+            keys.append(kind)
     got = dict(zip(keys, msearch(searches)))
-    for kind in ("news", "customer_story"):
+    for kind in PRODUCT_PAGE_TYPES:
         got[kind] = got.pop(f"{kind}_0", []) + got.pop(f"{kind}_1", [])
 
     if p.get("e2") and (b or p["pair"] or p["partners"]):
@@ -342,13 +348,14 @@ def run(q: str) -> dict:
         prods = hits[:5]
     sections = {"products": prods, **got}
 
-    order = ["products", "news", "customer_story", "compare", "category"]
+    order = ["products", *PRODUCT_PAGE_TYPES, "compare", *TOPIC_TYPES]
     if p["intent"]:
         order.remove(p["intent"])
         order.insert(0, p["intent"])
-    if any(norm(c["title"]) == nq for c in got.get("category", [])):
-        order.remove("category")
-        order.insert(0, "category")
+    for kind in TOPIC_TYPES:                        # an exact category/industry name goes first
+        if any(norm(c["title"]) == nq for c in got.get(kind, [])):
+            order.remove(kind)
+            order.insert(0, kind)
 
     return {
         "query": q,
