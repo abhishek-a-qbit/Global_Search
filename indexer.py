@@ -8,7 +8,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 from config import ALIAS, SITEMAPS, make_client
-from scripts.Textutil import pretty
+from scripts.Textutil import norm, pretty
 
 BATCH_SIZE = 1000
 SESSION = requests.Session()                         # sitemap downloads only
@@ -30,9 +30,25 @@ def sitemap_paths(url: str) -> list[str]:
     return list(dict.fromkeys(urlsplit(loc).path for loc in locs))
 
 
+PAGE_SLUGS = {"news": "News", "customer-story": "Customer Stories", "alternatives": "Alternatives"}
+
+
 def _title(path: str) -> str:
-    slug = unquote(path.rstrip("/").rsplit("/", 1)[-1])
-    return pretty(slug)
+    """Last path segment; a generic page slug ('/vendors/zoom/news') is named after its parent."""
+    parts = [unquote(p) for p in path.strip("/").split("/")]
+    if len(parts) > 1 and parts[-1] in PAGE_SLUGS:
+        return f"{pretty(parts[-2])} {PAGE_SLUGS[parts[-1]]}"
+    return pretty(parts[-1])
+
+
+def _owner_popularity(path: str, names_by_first_word: dict[str, list[tuple[str, int]]]) -> int:
+    """'/vendors/zoom/news' -> popularity of the vendor's most popular product ('Zoom Workplace')."""
+    parts = path.strip("/").split("/")
+    owner = norm(pretty(unquote(parts[-2]))) if len(parts) > 1 and parts[-1] in PAGE_SLUGS else ""
+    if not owner:
+        return 1
+    return max((p for name, p in names_by_first_word.get(owner.split()[0], [])
+                if name == owner or name.startswith(owner + " ")), default=1)
 
 
 def build_documents() -> list[dict]:
@@ -62,6 +78,15 @@ def build_documents() -> list[dict]:
         for product_id in pair:
             comparison_counts[product_id] = comparison_counts.get(product_id, 0) + 1
 
+    # Pages inherit their product's popularity, so "popular news" / "top comparisons" mean something
+    for product_id, product in products_by_id.items():
+        product["popularity"] = 1 + comparison_counts.get(product_id, 0)
+    names_by_first_word = {}
+    for p in products_by_id.values():
+        name = norm(p["name"])
+        if name:
+            names_by_first_word.setdefault(name.split()[0], []).append((name, p["popularity"]))
+
     documents = []
     for product_id, product in products_by_id.items():
         documents.append({
@@ -72,7 +97,7 @@ def build_documents() -> list[dict]:
             "product_names": [product["name"]],
             "product_ids": [product_id],
             "name_len": len(product["name"]),
-            "popularity": 1 + comparison_counts.get(product_id, 0),
+            "popularity": product["popularity"],
         })
 
     product_page_suffix = {"news": "News", "customer_story": "Customer Stories", "alternatives": "Alternatives"}
@@ -103,7 +128,7 @@ def build_documents() -> list[dict]:
                 "product_names": product_names,
                 "product_ids": product_ids,
                 "name_len": len(title),
-                "popularity": 1,
+                "popularity": product["popularity"] if product else _owner_popularity(path, names_by_first_word),
             })
 
     for path, pair in comparison_pairs:
@@ -125,7 +150,7 @@ def build_documents() -> list[dict]:
             "product_names": names,
             "product_ids": list(pair),
             "name_len": len(title),
-            "popularity": 1,
+            "popularity": sum(products_by_id.get(pid, {}).get("popularity", 1) for pid in pair),
         })
 
     return documents

@@ -75,7 +75,12 @@ Open <http://localhost:5500>. The frontend calls the API at `API_BASE` (top of t
 the frontend elsewhere, update `API_BASE` and add its origin to `CORS_ORIGINS`. The first indexing run downloads the configured
 sitemaps and may take some time. It builds a new collection and switches the
 search alias after a successful import, then deletes older build collections.
-Re-run `indexer.py` whenever you want to refresh the data. Keep the terminal
+Re-run `indexer.py` whenever you want to refresh the data (and after changing how
+documents are built, e.g. titles or `popularity`; restart the API afterwards, since
+category/industry aliases are cached in-process). Product popularity is
+1 + the number of comparisons a product appears in; news / customer story / alternatives
+pages inherit it from their product (vendor pages from the vendor's most popular product),
+and a comparison gets the sum of both products'. Keep the terminal
 running while using the app. In a second PowerShell window, you can check Typesense with:
 
 ```powershell
