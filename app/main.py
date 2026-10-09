@@ -1,13 +1,14 @@
 import time
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from typesense.exceptions import TypesenseClientError
 
+from config import CORS_ORIGINS
 from scripts import search
 
 app = FastAPI(title="Cuspera global search")
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET"], allow_headers=["*"])
 
 
 @app.get("/api/health")
@@ -30,11 +31,3 @@ def api_search(q: str = Query("", max_length=200)):
         raise HTTPException(503, f"Typesense error: {e}")
     result["took_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     return result
-
-
-# Serve the frontend at /
-app.mount(
-    "/",
-    StaticFiles(directory=Path(__file__).resolve().parents[1] / "frontend", html=True),
-    name="static",
-)

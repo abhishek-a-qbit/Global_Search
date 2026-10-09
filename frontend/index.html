@@ -44,6 +44,7 @@
 </main>
 
 <script>
+const API_BASE = "http://127.0.0.1:8000";                     // FastAPI backend (separate server)
 const EXAMPLES = ["6s", "6sense", "6sense news", "news 6sense", "algoli", "algolia", "algolia ne",
                   "algolia customer story", "canva vs fi", "canva figma", "figma and canva", "canva alternatives", "crm", "banking", "adob"];
 const $q = document.getElementById("q");
@@ -68,7 +69,7 @@ async function search(q) {
   if (q.trim().length < 2) { $meta.textContent = ""; $results.replaceChildren(); return; }
   controller = new AbortController();
   try {
-    const res = await fetch("/api/search?q=" + encodeURIComponent(q), { signal: controller.signal });
+    const res = await fetch(API_BASE + "/api/search?q=" + encodeURIComponent(q), { signal: controller.signal });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     render(await res.json());
   } catch (e) {

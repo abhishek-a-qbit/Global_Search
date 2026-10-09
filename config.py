@@ -6,6 +6,9 @@ import typesense
 TS_URL = os.getenv("TYPESENSE_URL", "http://127.0.0.1:8108")   # not "localhost": avoids a slow IPv6 attempt on Windows
 TS_KEY = os.getenv("TYPESENSE_API_KEY", "xyz")
 ALIAS = os.getenv("TYPESENSE_COLLECTION", "cuspera_pages")   # searches go through this alias
+# Comma-separated browser origins allowed to call the API (where the frontend is hosted)
+CORS_ORIGINS = [o.strip() for o in os.getenv(
+    "CORS_ORIGINS", "http://localhost:5500,http://127.0.0.1:5500").split(",") if o.strip()]
 
 BASE = "https://www.cuspera.com"
 # From {BASE}/sitemap.xml, excluding directory, dimension and vendors. Entries may be

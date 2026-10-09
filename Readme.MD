@@ -1,6 +1,7 @@
 # Cuspera global search
 
-FastAPI serves the search API and the frontend. The search engine is the official
+FastAPI serves the search API; the frontend (`frontend/`) is a separate static site
+that calls the API over HTTP (CORS-enabled). The search engine is the official
 Typesense server (v30.2), accessed through the official `typesense` Python client
 (v2.0.0). Typesense runs locally on your machine (Docker or WSL); no cloud service
 is needed.
@@ -63,7 +64,15 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
-Open <http://localhost:8000>. The first indexing run downloads the configured
+In a second PowerShell window, serve the frontend:
+
+```powershell
+.\.venv\Scripts\python.exe -m http.server 5500 --directory frontend
+```
+
+Open <http://localhost:5500>. The frontend calls the API at `API_BASE` (top of the
+`<script>` in `frontend/index.html`, default `http://127.0.0.1:8000`). If you host
+the frontend elsewhere, update `API_BASE` and add its origin to `CORS_ORIGINS`. The first indexing run downloads the configured
 sitemaps and may take some time. It builds a new collection and switches the
 search alias after a successful import, then deletes older build collections.
 Re-run `indexer.py` whenever you want to refresh the data. Keep the terminal
@@ -88,4 +97,5 @@ Invoke-RestMethod http://localhost:8108/health
 `GET /api/health` checks Typesense connectivity.
 
 Environment overrides: `TYPESENSE_URL`, `TYPESENSE_API_KEY`,
-`TYPESENSE_COLLECTION`.
+`TYPESENSE_COLLECTION`, `CORS_ORIGINS` (comma-separated, default
+`http://localhost:5500,http://127.0.0.1:5500`).

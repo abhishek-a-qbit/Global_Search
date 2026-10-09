@@ -1,4 +1,5 @@
 """Query understanding + grouped retrieval on top of Typesense."""
+import functools
 import re
 
 from config import ALIAS, BASE, make_client
@@ -21,6 +22,23 @@ SECTION_LABELS = {
 }
 PRODUCT_PAGE_TYPES = ("news", "customer_story", "alternatives")   # one page per product
 TOPIC_TYPES = ("category", "industry")                             # matched by title
+TOPIC_ALIASES = {        # extra names for categories / industries, keyed by normalized title
+    "crm": ["customer relationship management"],
+    "cpq": ["configure price quote"],
+    "pos": ["point of sale"],
+    "seo": ["search engine optimization"],
+    "business intelligence": ["bi"],
+    "public relations": ["pr"],
+    "human resources": ["hr"],
+    "information technology and services": ["it", "it services"],
+    "digital experience platform": ["dxp"],
+    "customer experience management": ["cx", "cxm"],
+    "employee experience management": ["ex", "exm"],
+    "e commerce platform": ["ecommerce"],
+    "e commerce software": ["ecommerce"],
+}
+INITIALS_SKIP = {"and", "or", "of"}
+INITIALS_BLOCKLIST = {"its"}                     # real words: would hijack plain queries
 
 
 def msearch(searches: list[dict]) -> list[list[dict]]:
@@ -301,6 +319,41 @@ def _dedupe(docs):
     return list({d["id"]: d for d in docs}.values())
 
 
+@functools.cache
+def topic_aliases() -> dict[str, list[dict]]:
+    """alias -> category/industry docs. Aliases: title initials ('abm') + TOPIC_ALIASES."""
+    docs, page = [], 1
+    while True:
+        batch = msearch([dict(q="*", filter_by=f"type:[{','.join(TOPIC_TYPES)}]", per_page=250, page=page)])[0]
+        docs += batch
+        if len(batch) < 250:
+            break
+        page += 1
+    out = {}
+    for d in docs:
+        title = norm(d["title"])
+        words = [w for w in title.split() if w not in INITIALS_SKIP]
+        initials = "".join(w[0] for w in words)
+        names = list(TOPIC_ALIASES.get(title, []))
+        if len(words) > 1 and len(initials) >= 3 and initials not in INITIALS_BLOCKLIST:
+            names.append(initials)
+        for name in names:
+            out.setdefault(name, []).append(d)
+    return out
+
+
+def topic_alias_hits(nq: str):
+    """(exact, inner, partial) alias matches: the whole query, a phrase inside it ('abm software'),
+    or a multi-word alias being typed ('customer rel'). Inner skips 2-letter aliases ('it', 'pr')."""
+    aliases = topic_aliases()
+    toks = nq.split()
+    spans = [" ".join(toks[i:j]) for i in range(len(toks))
+             for j in range(i + 1, min(len(toks), i + MAX_SPAN_TOKENS) + 1)]
+    inner = [d for s in spans if s != nq and len(s) >= 3 for d in aliases.get(s, [])]
+    partial = [d for a, ds in aliases.items() if " " in nq and a != nq and a.startswith(nq) for d in ds]
+    return aliases.get(nq, []), inner, partial
+
+
 def run(q: str) -> dict:
     nq = norm(q)
     if len(nq) < MIN_CHARS:
@@ -333,6 +386,15 @@ def run(q: str) -> dict:
     got = dict(zip(keys, msearch(searches)))
     for kind in PRODUCT_PAGE_TYPES:
         got[kind] = got.pop(f"{kind}_0", []) + got.pop(f"{kind}_1", [])
+    alias_exact, alias_inner, alias_partial = topic_alias_hits(nq)
+    if not anchor:                                  # 'abm xyz': nothing else matched, the abbreviation leads
+        alias_exact = alias_exact + alias_inner
+    for kind in TOPIC_TYPES:                        # abbreviations / full forms: 'abm' -> Account Based Marketing
+        exact = _dedupe(d for d in alias_exact + alias_inner if d["type"] == kind)
+        partial = [d for d in alias_partial if d["type"] == kind]
+        if exact or partial:
+            got[kind] = _dedupe(exact + got.get(kind, []) + partial)[:max(2, len(exact))]
+    alias_ids = {d["id"] for d in alias_exact}
 
     if p.get("e2") and (b or p["pair"] or p["partners"]):
         if p["pair"] or not b:
@@ -353,7 +415,7 @@ def run(q: str) -> dict:
         order.remove(p["intent"])
         order.insert(0, p["intent"])
     for kind in TOPIC_TYPES:                        # an exact category/industry name goes first
-        if any(norm(c["title"]) == nq for c in got.get(kind, [])):
+        if any(norm(c["title"]) == nq or c["id"] in alias_ids for c in got.get(kind, [])):
             order.remove(kind)
             order.insert(0, kind)
 
