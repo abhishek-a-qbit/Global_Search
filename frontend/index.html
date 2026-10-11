@@ -44,7 +44,8 @@
 </main>
 
 <script>
-const API_BASE = "http://127.0.0.1:8000";                     // FastAPI backend (separate server)
+// FastAPI backend: a separate server when served by `http.server 5500`, else same origin (FastAPI serves this page)
+const API_BASE = location.port === "5500" ? "http://127.0.0.1:8000" : "";
 const EXAMPLES = ["6s", "6sense", "6sense news", "news 6sense", "algoli", "algolia", "algolia ne",
                   "algolia customer story", "canva vs fi", "canva figma", "figma and canva", "canva alternatives", "crm", "banking", "adob"];
 const $q = document.getElementById("q");
@@ -70,6 +71,7 @@ async function search(q) {
   controller = new AbortController();
   try {
     const res = await fetch(API_BASE + "/api/search?q=" + encodeURIComponent(q), { signal: controller.signal });
+    if (res.status === 503) timer = setTimeout(() => search($q.value), 5000);   // cold start: retry while loading
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     render(await res.json());
   } catch (e) {

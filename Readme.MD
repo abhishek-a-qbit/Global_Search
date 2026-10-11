@@ -87,6 +87,25 @@ running while using the app. In a second PowerShell window, you can check Typese
 Invoke-RestMethod http://localhost:8108/health
 ```
 
+## Deploy for free on Render
+
+The root `Dockerfile` runs Typesense, the API and the frontend in one container
+(FastAPI serves `frontend/` at `/`). Free disks are ephemeral, so on every start
+`seed_index.py` loads the bundled `data/documents.jsonl.gz` into Typesense (about
+1.5 minutes on Render's free 0.1 CPU; searches return a "still loading" 503 until
+then and the page retries automatically). Typesense listens on localhost only,
+with a random API key per boot.
+
+1. Push the repository (including `data/documents.jsonl.gz`) to GitHub.
+2. On <https://render.com>, sign up (no card needed), then New > Blueprint and
+   pick the repository; `render.yaml` creates a free Docker web service.
+3. Open the `https://<name>.onrender.com` URL once the deploy is live.
+
+Free services sleep after 15 minutes without traffic; the next visit takes about
+a minute to wake up plus the index load. To ship fresh data, re-run `indexer.py`
+locally, then `.\.venv\Scripts\python.exe export_index.py`, commit the updated
+`data/documents.jsonl.gz` and push (Render redeploys automatically).
+
 ## API
 
 `GET /api/search?q=canva%20vs%20figma` returns grouped search results:

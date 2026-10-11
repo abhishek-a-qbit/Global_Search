@@ -1,0 +1,8 @@
+.git
+.venv
+venv
+ts-data
+**/__pycache__
+*.py[cod]
+.env
+_probe.py
