@@ -168,7 +168,7 @@ def resolve_products(texts) -> dict[str, list[dict]]:
 
     texts = [t for t in dict.fromkeys(texts) if len(t) >= MIN_CHARS]
     found = run_pools(texts, 0)
-    found.update(run_pools([t for t in texts if not found[t] and len(t) >= 4], 1))   # typos only when nothing matches
+    found.update(run_pools([t for t in texts if not found[t] and len(t) >= 4], 2))   # typos only when nothing matches
     return found
 
 
@@ -258,7 +258,7 @@ def interpret(nq: str) -> dict:
             if ra and ra["id"] == la["id"]:
                 ra, rr = None, "none"
             cands.append({"group": group, "kind": kind, "anchor": la, "rule": lr, "hits": lh, "e2": rtext,
-                          "b": ra if rr in RULE_RANK else None, "b_rule": rr})
+                          "b": ra if rr in RULE_RANK else None, "b_rule": rr, "e2_hits": rh})
 
         searches = []
         for c in cands:
@@ -283,17 +283,21 @@ def interpret(nq: str) -> dict:
         return cands
 
     def extract_products(ext_toks):
-        """Up to 2 confident product mentions anywhere in the query, skipping unmatched words."""
+        """Up to 2 product mentions anywhere in the query, skipping unmatched words; an
+        'ambiguous' span is a weak mention: not anchorable, but its hits still get shown."""
         spans = [(i, j) for i in range(len(ext_toks))
                  for j in range(i + 1, min(len(ext_toks), i + MAX_SPAN_TOKENS) + 1)]
         texts = [" ".join(ext_toks[i:j]) for i, j in spans]
         found.update(resolve_products([t for t in texts if t not in found]))
-        scored = sorted(((j - i, RULE_RANK[anchor(t)[1]], -i, i, j, t) for (i, j), t in zip(spans, texts)
-                         if anchor(t)[1] in RULE_RANK), reverse=True)    # longer span, stronger rule first
+        ext_rank = {**RULE_RANK, "ambiguous": 0}
+        scored = sorted(((j - i, ext_rank[anchor(t)[1]], -i, i, j, t) for (i, j), t in zip(spans, texts)
+                         if anchor(t)[1] in ext_rank), reverse=True)    # longer span, stronger rule first
         chosen = []
         for *_, i, j, t in scored:
+            mid = anchor(t)                    # dedupe by anchor doc, or the ambiguous span's top hit
             if all(j <= ci or i >= cj for ci, cj, _ in chosen) \
-                    and all(anchor(t)[0]["id"] != anchor(ct)[0]["id"] for _, _, ct in chosen):
+                    and all((mid[0] or mid[2][0])["id"] != (anchor(ct)[0] or anchor(ct)[2][0])["id"]
+                            for _, _, ct in chosen):
                 chosen.append((i, j, t))
             if len(chosen) == 2:
                 break
@@ -317,7 +321,8 @@ def interpret(nq: str) -> dict:
         has_page = bool(c["pair"] or c["partners"])
         return {"intent": intent or ("compare" if c["group"] == 0 or has_page else None),
                 "anchor": c["anchor"], "rule": c["rule"], "hits": c["hits"],
-                "anchor2": c["b"], "e2": c["e2"], "pair": c["pair"], "partners": c["partners"]}
+                "anchor2": c["b"], "e2": c["e2"], "e2_hits": c["e2_hits"],
+                "pair": c["pair"], "partners": c["partners"]}
 
     explicit = [c for c in cands if c["group"] == 0 and valid(c)]
     if explicit:
@@ -342,9 +347,20 @@ def interpret(nq: str) -> dict:
             c = evaluate([(3, mentions[0], mentions[1], "bare")])
             if c:                                   # 'outreach demandbase news': news of both products
                 return compare_result(c[0], intent if ckind is None else None)
-        if len(mentions) == 1 and anchor(mentions[0])[1] in ("exact", "parent"):
+            h1, h2 = anchor(mentions[0])[2], anchor(mentions[1])[2]
+            hits = _dedupe([d for pair in zip(h1, h2) for d in pair] + h1 + h2)
+            if hits:                                # neither side confident: offer both sides' candidates
+                return {"intent": intent if ckind is None else "compare", "anchor": None,
+                        "rule": "ambiguous", "hits": hits,
+                        "scope": [d["product_ids"][0] for d in hits[:10]]}
+        if len(mentions) == 1:
             a, r, h = anchor(mentions[0])
-            return {"intent": intent if ckind is None else "compare", "anchor": a, "rule": r, "hits": h}
+            if r in ("exact", "parent"):
+                return {"intent": intent if ckind is None else "compare", "anchor": a, "rule": r, "hits": h}
+            if r == "ambiguous":                    # one fuzzy mention: offer its product candidates
+                return {"intent": intent if ckind is None else "compare", "anchor": None,
+                        "rule": r, "hits": h, "entity": mentions[0],
+                        "scope": [d["product_ids"][0] for d in h[:10]]}
 
     if intent and not hits0:                        # 'news cr': no confident product yet, list candidates
         a, r, h = anchor(" ".join(rest))            # ... and lead with their intent pages
@@ -483,6 +499,9 @@ def run(q: str) -> dict:
         prods = [anchor, b]
     elif anchor:
         prods = ([anchor] + [h for h in hits if h["id"] != anchor["id"]])[:3]
+        if p.get("e2"):                             # 2nd side unmatched/ambiguous: offer its candidates
+            seen = {h["id"] for h in prods}
+            prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen][:2]
     else:
         prods = hits[:5]
     sections = {"products": prods, **got}
