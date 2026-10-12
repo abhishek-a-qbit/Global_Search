@@ -352,7 +352,7 @@ def interpret(nq: str) -> dict:
             if hits:                                # neither side confident: offer both sides' candidates
                 return {"intent": intent if ckind is None else "compare", "anchor": None,
                         "rule": "ambiguous", "hits": hits,
-                        "scope": [d["product_ids"][0] for d in hits[:10]]}
+                        "scope": [d["product_ids"][0] for d in hits]}
         if len(mentions) == 1:
             a, r, h = anchor(mentions[0])
             if r in ("exact", "parent"):
@@ -360,12 +360,12 @@ def interpret(nq: str) -> dict:
             if r == "ambiguous":                    # one fuzzy mention: offer its product candidates
                 return {"intent": intent if ckind is None else "compare", "anchor": None,
                         "rule": r, "hits": h, "entity": mentions[0],
-                        "scope": [d["product_ids"][0] for d in h[:10]]}
+                        "scope": [d["product_ids"][0] for d in h]}
 
     if intent and not hits0:                        # 'news cr': no confident product yet, list candidates
         a, r, h = anchor(" ".join(rest))            # ... and lead with their intent pages
         return {"intent": intent, "anchor": None, "rule": r, "hits": h,
-                "scope": [d["product_ids"][0] for d in h[:10]], "entity": " ".join(rest)}
+                "scope": [d["product_ids"][0] for d in h], "entity": " ".join(rest)}
     return plain
 
 
@@ -501,9 +501,9 @@ def run(q: str) -> dict:
         prods = ([anchor] + [h for h in hits if h["id"] != anchor["id"]])[:3]
         if p.get("e2"):                             # 2nd side unmatched/ambiguous: offer its candidates
             seen = {h["id"] for h in prods}
-            prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen][:2]
+            prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen]
     else:
-        prods = hits[:5]
+        prods = hits if p["rule"] == "ambiguous" else hits[:5]
     sections = {"products": prods, **got}
 
     order = ["products", *PRODUCT_PAGE_TYPES, "compare", *TOPIC_TYPES]
