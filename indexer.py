@@ -1,8 +1,10 @@
 """Build the Typesense collection from the configured Cuspera sitemaps."""
 import hashlib
+import json
 import re
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import requests
@@ -11,6 +13,10 @@ from config import ALIAS, SITEMAPS, make_client
 from scripts.Textutil import norm, pretty
 
 BATCH_SIZE = 1000
+USE_CASES_FILE = Path(__file__).parent / "product_usecases.json"   # {"CFProdCode-<product id>": [{"id", "name"}, ...]}
+USE_CASE_TOP_PRODUCTS = 5
+CATEGORIES_FILE = Path(__file__).parent / "product_categories.json"   # {"CFProdCode-<product id>": "<category slug>"}
+CATEGORY_SLUG_FIXES = {"abm": "account-based-marketing"}
 SESSION = requests.Session()                         # sitemap downloads only
 client = make_client(timeout_seconds=120)            # bulk imports can be slow
 
@@ -156,6 +162,71 @@ def build_documents() -> list[dict]:
     return documents
 
 
+def add_product_categories(documents: list[dict]) -> None:
+    """Store each product's category page (id, title, path) on its product document."""
+    if not CATEGORIES_FILE.exists():
+        return
+    pages = {d["path"].rstrip("/").rsplit("/", 1)[-1]: d for d in documents if d["type"] == "category"}
+    raw = json.loads(CATEGORIES_FILE.read_text(encoding="utf-8"))
+    for d in documents:
+        slug = raw.get(f"CFProdCode-{d['product_ids'][0]}") if d["type"] == "product" else None
+        if not slug:
+            continue
+        slug = CATEGORY_SLUG_FIXES.get(slug, slug)
+        page = pages.get(slug) or pages.get(f"{slug}s")   # 'payment-gateway' -> '/categories/payment-gateways'
+        if page:
+            d.update(category_id=page["id"], category_title=page["title"], category_path=page["path"])
+
+
+def build_use_case_documents(documents: list[dict]) -> list[dict]:
+    """Use cases live on the product page ('/products/...#use-cases'), so two document types:
+    'use_cases', one per product with its names in order; 'use_case', one per distinct name with
+    its most popular products. Products missing from the sitemaps have no page and are skipped."""
+    if not USE_CASES_FILE.exists():
+        return []
+    products = {d["product_ids"][0]: d for d in documents if d["type"] == "product"}
+    raw = json.loads(USE_CASES_FILE.read_text(encoding="utf-8"))
+    out, by_name = [], {}
+    for key, entries in raw.items():
+        product = products.get(int(key.rsplit("-", 1)[-1]))
+        if not product:
+            continue
+        names = {}                                   # normalized -> first spelling, in file order
+        for e in entries:
+            names.setdefault(norm(e["name"]), e["name"].strip())
+        names.pop("", None)
+        if not names:
+            continue
+        title = f"{product['title']} Use Cases"
+        out.append({
+            "id": f"use_cases-{product['product_ids'][0]}",
+            "type": "use_cases",
+            "title": title,
+            "path": f"{product['path']}#use-cases",
+            "product_names": product["product_names"],
+            "product_ids": product["product_ids"],
+            "name_len": len(title),
+            "popularity": product["popularity"],
+            "use_case_names": list(names.values()),
+        })
+        for key_name, name in names.items():
+            by_name.setdefault(key_name, (name, []))[1].append(product)
+
+    for key_name, (name, prods) in by_name.items():
+        top = sorted(prods, key=lambda p: (-p["popularity"], p["name_len"]))[:USE_CASE_TOP_PRODUCTS]
+        out.append({
+            "id": f"use_case-{hashlib.sha1(key_name.encode('utf-8')).hexdigest()}",
+            "type": "use_case",
+            "title": name,
+            "path": f"{top[0]['path']}#use-cases",
+            "product_names": [],
+            "product_ids": [p["product_ids"][0] for p in top],
+            "name_len": len(name),
+            "popularity": len(prods),
+        })
+    return out
+
+
 def _schema(collection_name: str) -> dict:
     return {
         "name": collection_name,
@@ -201,6 +272,8 @@ def main() -> None:
     documents = build_documents()
     if not documents:
         raise RuntimeError("No documents were found in the configured sitemaps")
+    add_product_categories(documents)
+    documents += build_use_case_documents(documents)
 
     collection_name = f"{ALIAS}_build_{int(time.time())}"
     client.collections.create(_schema(collection_name))

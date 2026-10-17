@@ -19,8 +19,12 @@ SECTION_LABELS = {
     "compare": "Comparisons",
     "category": "Categories",
     "industry": "Industries",
+    "use_cases": "Use cases",
+    "use_case": "Use cases",
 }
-PRODUCT_PAGE_TYPES = ("news", "customer_story", "alternatives")   # one page per product
+PRODUCT_PAGE_TYPES = ("news", "customer_story", "alternatives", "use_cases")   # one page per product
+VENDOR_PAGE_TYPES = ("news", "customer_story", "alternatives")                # ... also per vendor
+USE_CASES_SHOWN = 10                                                            # names listed per product
 TOPIC_TYPES = ("category", "industry")                             # matched by title
 TOPIC_ALIASES = {        # extra names for categories / industries, keyed by normalized title
     "crm": ["customer relationship management"],
@@ -44,7 +48,8 @@ INITIALS_BLOCKLIST = {"its"}                     # real words: would hijack plai
 def msearch(searches: list[dict]) -> list[list[dict]]:
     if not searches:
         return []
-    response = client.multi_search.perform({"searches": [{"collection": ALIAS, **s} for s in searches]})
+    response = client.multi_search.perform({"searches": [{"collection": ALIAS, "exclude_fields": "use_case_names", **s}
+                                                         for s in searches]})   # long lists: fetched only when shown
     out = []
     for res in response["results"]:
         if "error" in res:
@@ -60,6 +65,7 @@ INTENT_PHRASES = {
                        "case study", "case studies"],
     "compare": ["compare", "comparison", "comparisons"],
     "alternatives": ["alternatives", "alternative", "competitors", "competitor"],
+    "use_cases": ["use case", "use cases", "usecase", "usecases"],
 }
 PHRASE_INTENT = {ph: intent for intent, phrases in INTENT_PHRASES.items() for ph in phrases}
 HARD_SEPS = {"vs", "versus", "v"}
@@ -378,7 +384,8 @@ def _dedupe(docs):
     return list({d["id"]: d for d in docs}.values())
 
 
-PAGE_TITLE_SUFFIX = {"news": "news", "customer_story": "customer stories", "alternatives": "alternatives"}
+PAGE_TITLE_SUFFIX = {"news": "news", "customer_story": "customer stories", "alternatives": "alternatives",
+                     "use_cases": "use cases"}
 
 
 def _vendor_of(d: dict, kind: str, product_name: str) -> bool:
@@ -435,12 +442,14 @@ def run(q: str) -> dict:
         aid = anchor["product_ids"][0]
         for i, prod in enumerate([anchor] + ([b] if b else [])):   # group info for both products
             for kind in PRODUCT_PAGE_TYPES:
+                names = kind == "use_cases" and p["intent"] == "use_cases"   # 'salesforce use cases': list them
                 searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={prod['product_ids'][0]}",
-                                     per_page=1))
+                                     per_page=1, **({"exclude_fields": ""} if names else {})))
                 keys.append(f"{kind}_{i}")
-                searches.append(dict(q=norm(prod["product_names"][0]).split()[0], query_by="title",
-                                     filter_by=f"type:={kind}", num_typos=0, prefix=False, per_page=10))
-                keys.append(f"{kind}_vendor_{i}")
+                if kind in VENDOR_PAGE_TYPES:
+                    searches.append(dict(q=norm(prod["product_names"][0]).split()[0], query_by="title",
+                                         filter_by=f"type:={kind}", num_typos=0, prefix=False, per_page=10))
+                    keys.append(f"{kind}_vendor_{i}")
         if not p.get("e2") or not (b or p["pair"] or p["partners"]):   # nothing matched the 2nd side: show anchor's
             searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={aid}",
                                  sort_by="popularity:desc", per_page=5))
@@ -466,6 +475,11 @@ def run(q: str) -> dict:
             searches.append(dict(q=nq, query_by="title", filter_by=f"type:={kind}",
                                  prefix=True, num_typos=0, per_page=2))
             keys.append(kind)
+    if p["intent"] in (None, "compare") and not b and len(nq.split()) >= 2 and p["rule"] not in ("exact", "parent"):
+        searches.append(dict(q=nq, query_by="title", filter_by="type:=use_case", prefix=True, num_typos=0,
+                             drop_tokens_threshold=0, sort_by="_text_match(buckets: 3):desc,popularity:desc",
+                             per_page=20))          # 'lead management automation': a use-case name
+        keys.append("use_case")
     got = dict(zip(keys, msearch(searches)))
     if not anchor and p.get("entity"):              # keep the candidates' ranking: 'news cr' -> Crayon News first
         rank = {pid: i for i, pid in enumerate(p["scope"])}
@@ -479,6 +493,23 @@ def run(q: str) -> dict:
             if prod and not own:                    # no page of its own: 'Demandbase One' -> Demandbase News
                 own = [d for d in vendor if _vendor_of(d, kind, norm(prod["product_names"][0]))][:1]
             got[kind] = got.get(kind, []) + own
+    if anchor and p["intent"] == "use_cases":       # one link per name, to the product page's use-case section
+        got["use_cases"] = [{"id": f"{d['id']}-{k}", "path": d["path"], "type": "use_case",
+                             "title": f"{d['product_names'][0]}: {name}" if b else name}
+                            for d in got.get("use_cases", [])
+                            for k, name in enumerate(d["use_case_names"][:USE_CASES_SHOWN])]
+    uc = got["use_case"] = sorted(got.get("use_case", []),   # names starting with the query first
+                                  key=lambda d: -match_tier(norm(d["title"]), nq))[:5]
+    uc_lead = bool(uc) and match_tier(norm(uc[0]["title"]), nq) >= 2   # the query is (the start of) a use case
+    uc_prods = []
+    if uc_lead:                                     # ... its most popular products lead, linked to their use cases
+        ids = uc[0]["product_ids"]
+        by_id = {d["product_ids"][0]: d for d in msearch([dict(
+            q="*", filter_by=f"type:=product && product_ids:[{','.join(map(str, ids))}]", per_page=len(ids))])[0]}
+        uc_prods = [dict(by_id[i], path=f"{by_id[i]['path']}#use-cases") for i in ids if i in by_id]
+        if not anchor and p["intent"] == "compare":    # 'customer engagement and retention': not 2 products
+            got.pop("compare", None)
+            p = {**p, "intent": None}
     alias_exact, alias_inner, alias_partial = topic_alias_hits(nq)
     if not anchor:                                  # 'abm xyz': nothing else matched, the abbreviation leads
         alias_exact = alias_exact + alias_inner
@@ -488,6 +519,10 @@ def run(q: str) -> dict:
         if exact or partial:
             got[kind] = _dedupe(exact + got.get(kind, []) + partial)[:max(2, len(exact))]
     alias_ids = {d["id"] for d in alias_exact}
+    if anchor and anchor.get("category_id") and (not b or b.get("category_id") == anchor["category_id"]):
+        got["category"] = _dedupe([{"id": anchor["category_id"], "title": anchor["category_title"],
+                                    "path": anchor["category_path"], "type": "category"}]
+                                  + got.get("category", []))   # the product's category (in a comparison: shared)
 
     if p.get("e2") and (b or p["pair"] or p["partners"]):
         if p["pair"] or not b:
@@ -504,12 +539,20 @@ def run(q: str) -> dict:
             prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen]
     else:
         prods = hits if p["rule"] == "ambiguous" else hits[:5]
+    uc_ids = {d["id"] for d in uc_prods}
+    lead = prods[:1] if anchor and match_tier(norm(anchor["title"]), nq) >= 2 else []   # 'lead management
+    # automation' -> the product named that way still comes first; a loose match ('sales and marketing ali') does not
+    prods = lead + [d for d in uc_prods if d["id"] not in {x["id"] for x in lead}] + \
+        [h for h in prods[len(lead):] if h["id"] not in uc_ids]
     sections = {"products": prods, **got}
 
-    order = ["products", *PRODUCT_PAGE_TYPES, "compare", *TOPIC_TYPES]
+    order = ["products", *PRODUCT_PAGE_TYPES, "compare", *TOPIC_TYPES, "use_case"]
     if p["intent"]:
         order.remove(p["intent"])
         order.insert(0, p["intent"])
+    if uc_lead:                                     # the use case leads, then the products that have it
+        order.remove("use_case")
+        order.insert(0, "use_case")
     for kind in TOPIC_TYPES:                        # an exact category/industry name goes first
         if any(norm(c["title"]) == nq or c["id"] in alias_ids for c in got.get(kind, [])):
             order.remove(kind)
