@@ -66,6 +66,7 @@ INTENT_PHRASES = {
     "compare": ["compare", "comparison", "comparisons"],
     "alternatives": ["alternatives", "alternative", "competitors", "competitor"],
     "use_cases": ["use case", "use cases", "usecase", "usecases"],
+    "category": ["category", "categories"],
 }
 PHRASE_INTENT = {ph: intent for intent, phrases in INTENT_PHRASES.items() for ph in phrases}
 HARD_SEPS = {"vs", "versus", "v"}
@@ -546,7 +547,7 @@ def run(q: str) -> dict:
         [h for h in prods[len(lead):] if h["id"] not in uc_ids]
     sections = {"products": prods, **got}
 
-    order = ["products", *PRODUCT_PAGE_TYPES, "compare", *TOPIC_TYPES, "use_case"]
+    order = ["products", "category", *PRODUCT_PAGE_TYPES, "compare", "industry", "use_case"]
     if p["intent"]:
         order.remove(p["intent"])
         order.insert(0, p["intent"])
