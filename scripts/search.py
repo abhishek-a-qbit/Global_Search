@@ -520,10 +520,10 @@ def run(q: str) -> dict:
         if exact or partial:
             got[kind] = _dedupe(exact + got.get(kind, []) + partial)[:max(2, len(exact))]
     alias_ids = {d["id"] for d in alias_exact}
-    if anchor and anchor.get("category_id") and (not b or b.get("category_id") == anchor["category_id"]):
-        got["category"] = _dedupe([{"id": anchor["category_id"], "title": anchor["category_title"],
-                                    "path": anchor["category_path"], "type": "category"}]
-                                  + got.get("category", []))   # the product's category (in a comparison: shared)
+    prod_cats = [{"id": d["category_id"], "title": d["category_title"], "path": d["category_path"], "type": "category"}
+                 for d in (anchor, b) if d and d.get("category_id")]
+    if prod_cats:                                   # the product's category (in a comparison: both, if different)
+        got["category"] = _dedupe(prod_cats + got.get("category", []))
 
     if p.get("e2") and (b or p["pair"] or p["partners"]):
         if p["pair"] or not b:
