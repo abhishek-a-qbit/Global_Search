@@ -16,5 +16,5 @@ COPY data/documents.jsonl.gz ./data/
 COPY docker/start.sh /start.sh
 RUN chmod +x /start.sh
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 SEMANTIC_USE_CASES=0 CATALOG_API=0
 CMD ["/start.sh"]

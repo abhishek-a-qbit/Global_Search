@@ -2,7 +2,7 @@
 import functools
 import re
 
-from config import ALIAS, BASE, make_client
+from config import ALIAS, BASE, SEMANTIC_MAX_DISTANCE, SEMANTIC_USE_CASES, make_client
 from scripts.Textutil import norm
 
 MIN_CHARS = 2
@@ -43,12 +43,23 @@ TOPIC_ALIASES = {        # extra names for categories / industries, keyed by nor
 }
 INITIALS_SKIP = {"and", "or", "of"}
 INITIALS_BLOCKLIST = {"its"}                     # real words: would hijack plain queries
+HEAVY_FIELDS = "use_case_names,use_case_text,embedding,use_case_ids"
+
+
+def use_case_search(nq: str, semantic: bool = SEMANTIC_USE_CASES) -> dict:
+    """Use-case names by meaning only (pure vector search, closest first): 'companies visiting my
+    site' -> 'Website visitor identification'; weak matches are cut off. Keyword search if disabled."""
+    if semantic:
+        return dict(q=nq, query_by="embedding", filter_by="type:=use_case", per_page=20,
+                    vector_query=f"embedding:([], distance_threshold: {SEMANTIC_MAX_DISTANCE})")
+    return dict(q=nq, query_by="title", filter_by="type:=use_case", prefix=True, num_typos=0,
+                drop_tokens_threshold=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=20)
 
 
 def msearch(searches: list[dict]) -> list[list[dict]]:
     if not searches:
         return []
-    response = client.multi_search.perform({"searches": [{"collection": ALIAS, "exclude_fields": "use_case_names", **s}
+    response = client.multi_search.perform({"searches": [{"collection": ALIAS, "exclude_fields": HEAVY_FIELDS, **s}
                                                          for s in searches]})   # long lists: fetched only when shown
     out = []
     for res in response["results"]:
@@ -430,7 +441,8 @@ def topic_alias_hits(nq: str):
     return aliases.get(nq, []), inner, partial
 
 
-def run(q: str) -> dict:
+def run(q: str, semantic: bool | None = None) -> dict:
+    semantic = SEMANTIC_USE_CASES if semantic is None else semantic
     nq = norm(q)
     if len(nq) < MIN_CHARS:
         return {"query": q, "rule": "too_short", "anchor": None, "anchor2": None, "intent": None, "sections": []}
@@ -445,7 +457,8 @@ def run(q: str) -> dict:
             for kind in PRODUCT_PAGE_TYPES:
                 names = kind == "use_cases" and p["intent"] == "use_cases"   # 'salesforce use cases': list them
                 searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={prod['product_ids'][0]}",
-                                     per_page=1, **({"exclude_fields": ""} if names else {})))
+                                     per_page=1, **({"exclude_fields": "use_case_text,embedding,use_case_ids"}
+                                                    if names else {})))
                 keys.append(f"{kind}_{i}")
                 if kind in VENDOR_PAGE_TYPES:
                     searches.append(dict(q=norm(prod["product_names"][0]).split()[0], query_by="title",
@@ -477,12 +490,10 @@ def run(q: str) -> dict:
                                  prefix=True, num_typos=0, per_page=2))
             keys.append(kind)
     if p["intent"] in (None, "compare") and not b and len(nq.split()) >= 2 and p["rule"] not in ("exact", "parent"):
-        searches.append(dict(q=nq, query_by="title", filter_by="type:=use_case", prefix=True, num_typos=0,
-                             drop_tokens_threshold=0, sort_by="_text_match(buckets: 3):desc,popularity:desc",
-                             per_page=20))          # 'lead management automation': a use-case name
+        searches.append(use_case_search(nq, semantic))   # 'lead management automation': a use-case name
         keys.append("use_case")
     got = dict(zip(keys, msearch(searches)))
-    if not anchor and p.get("entity"):              # keep the candidates' ranking: 'news cr' -> Crayon News first
+    if not anchor and p["intent"] and p.get("entity"):   # keep the candidates' ranking: 'news cr' -> Crayon News first
         rank = {pid: i for i, pid in enumerate(p["scope"])}
         scoped = sorted(got.get(p["intent"], []), key=lambda d: min(
             rank.get(pid, len(rank)) for pid in d["product_ids"]))
@@ -499,8 +510,10 @@ def run(q: str) -> dict:
                              "title": f"{d['product_names'][0]}: {name}" if b else name}
                             for d in got.get("use_cases", [])
                             for k, name in enumerate(d["use_case_names"][:USE_CASES_SHOWN])]
-    uc = got["use_case"] = sorted(got.get("use_case", []),   # names starting with the query first
-                                  key=lambda d: -match_tier(norm(d["title"]), nq))[:5]
+    uc = got.get("use_case", [])                    # semantic: closest meaning first, as returned
+    if not semantic:                                # keyword: names starting with the query first
+        uc = sorted(uc, key=lambda d: -match_tier(norm(d["title"]), nq))
+    uc = got["use_case"] = list({norm(d["title"]): d for d in reversed(uc)}.values())[::-1][:5]   # one per name
     uc_lead = bool(uc) and match_tier(norm(uc[0]["title"]), nq) >= 2   # the query is (the start of) a use case
     uc_prods = []
     if uc_lead:                                     # ... its most popular products lead, linked to their use cases
@@ -565,6 +578,7 @@ def run(q: str) -> dict:
         "intent": p["intent"],
         "anchor": anchor["title"] if anchor else None,
         "anchor2": b["title"] if b else None,
+        "use_cases_semantic": bool(semantic and uc),   # use cases matched by meaning, not words
         "sections": [
             {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]]}
             for k in order if sections.get(k)

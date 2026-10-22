@@ -10,6 +10,16 @@ ALIAS = os.getenv("TYPESENSE_COLLECTION", "cuspera_pages")   # searches go throu
 CORS_ORIGINS = [o.strip() for o in os.getenv(
     "CORS_ORIGINS", "http://localhost:5500,http://127.0.0.1:5500").split(",") if o.strip()]
 
+# Semantic (pure vector) use-case search: Typesense embeds use-case names with a built-in model.
+# Off in the Render image (too slow / too much memory there); requires re-running indexer.py.
+SEMANTIC_USE_CASES = os.getenv("SEMANTIC_USE_CASES", "1") == "1"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "ts/all-MiniLM-L12-v2")
+SEMANTIC_MAX_DISTANCE = float(os.getenv("SEMANTIC_MAX_DISTANCE", "0.45"))    # cosine distance cut-off
+# (relevant matches measured at <= ~0.44, gibberish at ~0.78)
+
+# Catalog write API (create / update / delete). No auth: local use only; off in the Docker image.
+CATALOG_API = os.getenv("CATALOG_API", "1") == "1"
+
 BASE = "https://www.cuspera.com"
 # From {BASE}/sitemap.xml, excluding directory, dimension and vendors. Entries may be
 # sitemap indexes (e.g. compare-index.xml); the indexer follows them recursively.

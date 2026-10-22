@@ -1,22 +1,27 @@
-"""Build the Typesense collection from the configured Cuspera sitemaps."""
-import hashlib
+"""Build the Typesense collection from the configured Cuspera sitemaps (initial build).
+
+After that, changes go through the catalog API (app/catalog_api.py): a rebuild replaces the
+whole index, so it refuses to run while the search alias exists unless --force is given."""
 import json
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 import requests
+from typesense.exceptions import ObjectNotFound
 
-from config import ALIAS, SITEMAPS, make_client
+from config import ALIAS, EMBED_MODEL, SEMANTIC_USE_CASES, SITEMAPS, make_client
+from scripts.documents import (category_slug_candidates, compare_doc, page_doc, page_owner, product_doc,
+                               record_doc, unique_use_cases, use_case_doc, use_cases_doc)
 from scripts.Textutil import norm, pretty
 
 BATCH_SIZE = 1000
+PRODUCTS_FILE = Path(__file__).parent / "prod.json"   # {"CFProdCode-<id>": {"tool_id", "soft", "cat"?, "cats"?}}
 USE_CASES_FILE = Path(__file__).parent / "product_usecases.json"   # {"CFProdCode-<product id>": [{"id", "name"}, ...]}
-USE_CASE_TOP_PRODUCTS = 5
 CATEGORIES_FILE = Path(__file__).parent / "product_categories.json"   # {"CFProdCode-<product id>": "<category slug>"}
-CATEGORY_SLUG_FIXES = {"abm": "account-based-marketing"}
 SESSION = requests.Session()                         # sitemap downloads only
 client = make_client(timeout_seconds=120)            # bulk imports can be slow
 
@@ -36,28 +41,41 @@ def sitemap_paths(url: str) -> list[str]:
     return list(dict.fromkeys(urlsplit(loc).path for loc in locs))
 
 
-PAGE_SLUGS = {"news": "News", "customer-story": "Customer Stories", "alternatives": "Alternatives"}
-
-
-def _title(path: str) -> str:
-    """Last path segment; a generic page slug ('/vendors/zoom/news') is named after its parent."""
-    parts = [unquote(p) for p in path.strip("/").split("/")]
-    if len(parts) > 1 and parts[-1] in PAGE_SLUGS:
-        return f"{pretty(parts[-2])} {PAGE_SLUGS[parts[-1]]}"
-    return pretty(parts[-1])
-
-
 def _owner_popularity(path: str, names_by_first_word: dict[str, list[tuple[str, int]]]) -> int:
     """'/vendors/zoom/news' -> popularity of the vendor's most popular product ('Zoom Workplace')."""
-    parts = path.strip("/").split("/")
-    owner = norm(pretty(unquote(parts[-2]))) if len(parts) > 1 and parts[-1] in PAGE_SLUGS else ""
+    owner = page_owner(path)
     if not owner:
         return 1
     return max((p for name, p in names_by_first_word.get(owner.split()[0], [])
                 if name == owner or name.startswith(owner + " ")), default=1)
 
 
-def build_documents() -> list[dict]:
+def build_records() -> dict[int, dict]:
+    """Hidden source records: every prod.json product with its use cases and category link
+    (product_categories.json), whether or not it has a page."""
+    def load(path):
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+    products, use_cases, links = load(PRODUCTS_FILE), load(USE_CASES_FILE), load(CATEGORIES_FILE)
+    records = {}
+    for key, r in products.items():
+        pid = int(key.rsplit("-", 1)[-1])
+        records[pid] = record_doc(pid, r["soft"].strip(), r.get("cat"), r.get("cats", []), links.get(key),
+                                  unique_use_cases(use_cases.get(key, [])))
+    return records
+
+
+def category_names(records: dict[int, dict]) -> dict[str, str]:
+    """Category slug -> name, from the products' cat / cats."""
+    names = {}
+    for rec in records.values():
+        data = json.loads(rec["record_json"])
+        for c in ([data["cat"]] if "cat" in data else []) + data.get("cats", []):
+            names.setdefault(c["perma"], c["name"].strip())
+    return names
+
+
+def build_documents(records: dict[int, dict]) -> list[dict]:
     paths_by_kind = {
         kind: list(dict.fromkeys(path for url in urls for path in sitemap_paths(url)))
         for kind, urls in SITEMAPS.items()
@@ -71,7 +89,8 @@ def build_documents() -> list[dict]:
         if not match:
             continue
         product_id = int(match.group(1))
-        name = pretty(re.sub(r"-x-\d+$", "", path.rstrip("/").rsplit("/", 1)[-1]))
+        name = records[product_id]["title"] if product_id in records else \
+            pretty(re.sub(r"-x-\d+$", "", path.rstrip("/").rsplit("/", 1)[-1]))
         products_by_id[product_id] = {"name": name, "path": path}
 
     comparison_counts = {}
@@ -93,20 +112,10 @@ def build_documents() -> list[dict]:
         if name:
             names_by_first_word.setdefault(name.split()[0], []).append((name, p["popularity"]))
 
-    documents = []
-    for product_id, product in products_by_id.items():
-        documents.append({
-            "id": f"product-{product_id}",
-            "type": "product",
-            "title": product["name"],
-            "path": product["path"],
-            "product_names": [product["name"]],
-            "product_ids": [product_id],
-            "name_len": len(product["name"]),
-            "popularity": product["popularity"],
-        })
+    topic_names = category_names(records)
+    product_docs = {pid: product_doc(pid, p["name"], p["path"], p["popularity"]) for pid, p in products_by_id.items()}
+    documents = list(product_docs.values())
 
-    product_page_suffix = {"news": "News", "customer_story": "Customer Stories", "alternatives": "Alternatives"}
     for sitemap_kind, document_type in (
         ("news", "news"),
         ("customer-story", "customer_story"),
@@ -115,27 +124,12 @@ def build_documents() -> list[dict]:
         ("industries", "industry"),
     ):
         for path in paths_by_kind[sitemap_kind]:
-            path_hash = hashlib.sha1(path.encode("utf-8")).hexdigest()
             product_match = re.search(r"/products/[^/]*-x-(\d+)/(?:news|customer-story|alternatives)$", path)
-            product_id = int(product_match.group(1)) if product_match else None
-            product = products_by_id.get(product_id) if product_id is not None else None
-            product_ids = [product_id] if product else []
-            product_names = [product["name"]] if product else []
-            title = (
-                f"{product['name']} {product_page_suffix[document_type]}"
-                if product
-                else _title(path)
-            )
-            documents.append({
-                "id": f"{document_type}-{path_hash}",
-                "type": document_type,
-                "title": title,
-                "path": path,
-                "product_names": product_names,
-                "product_ids": product_ids,
-                "name_len": len(title),
-                "popularity": product["popularity"] if product else _owner_popularity(path, names_by_first_word),
-            })
+            product = product_docs.get(int(product_match.group(1))) if product_match else None
+            doc = page_doc(document_type, path, product, popularity=_owner_popularity(path, names_by_first_word))
+            if document_type == "category" and (title := topic_names.get(path.rstrip("/").rsplit("/", 1)[-1])):
+                doc.update(title=title, name_len=len(title))
+            documents.append(doc)
 
     for path, pair in comparison_pairs:
         comparison_slug = path.strip("/").split("/")[-3]
@@ -146,84 +140,37 @@ def build_documents() -> list[dict]:
             if not name:
                 name = pretty(slug_names[index]) if len(slug_names) == 2 else f"Product {product_id}"
             names.append(name)
-        title = f"{names[0]} vs {names[1]}"
-        path_hash = hashlib.sha1(path.encode("utf-8")).hexdigest()
-        documents.append({
-            "id": f"compare-{path_hash}",
-            "type": "compare",
-            "title": title,
-            "path": path,
-            "product_names": names,
-            "product_ids": list(pair),
-            "name_len": len(title),
-            "popularity": sum(products_by_id.get(pid, {}).get("popularity", 1) for pid in pair),
-        })
+        documents.append(compare_doc(path, pair, names,
+                                     sum(products_by_id.get(pid, {}).get("popularity", 1) for pid in pair)))
 
     return documents
 
 
-def add_product_categories(documents: list[dict]) -> None:
+def add_product_categories(documents: list[dict], records: dict[int, dict]) -> None:
     """Store each product's category page (id, title, path) on its product document."""
-    if not CATEGORIES_FILE.exists():
-        return
     pages = {d["path"].rstrip("/").rsplit("/", 1)[-1]: d for d in documents if d["type"] == "category"}
-    raw = json.loads(CATEGORIES_FILE.read_text(encoding="utf-8"))
     for d in documents:
-        slug = raw.get(f"CFProdCode-{d['product_ids'][0]}") if d["type"] == "product" else None
-        if not slug:
-            continue
-        slug = CATEGORY_SLUG_FIXES.get(slug, slug)
-        page = pages.get(slug) or pages.get(f"{slug}s")   # 'payment-gateway' -> '/categories/payment-gateways'
+        rec = records.get(d["product_ids"][0]) if d["type"] == "product" else None
+        slug = rec.get("category_link") if rec else None
+        page = next((pages[s] for s in category_slug_candidates(slug) if s in pages), None) if slug else None
         if page:
             d.update(category_id=page["id"], category_title=page["title"], category_path=page["path"])
 
 
-def build_use_case_documents(documents: list[dict]) -> list[dict]:
+def build_use_case_documents(documents: list[dict], records: dict[int, dict]) -> list[dict]:
     """Use cases live on the product page ('/products/...#use-cases'), so two document types:
-    'use_cases', one per product with its names in order; 'use_case', one per distinct name with
-    its most popular products. Products missing from the sitemaps have no page and are skipped."""
-    if not USE_CASES_FILE.exists():
-        return []
-    products = {d["product_ids"][0]: d for d in documents if d["type"] == "product"}
-    raw = json.loads(USE_CASES_FILE.read_text(encoding="utf-8"))
-    out, by_name = [], {}
-    for key, entries in raw.items():
-        product = products.get(int(key.rsplit("-", 1)[-1]))
-        if not product:
+    'use_cases', one per product with its names in order; 'use_case', one per use case (UUID) with
+    its most popular products. Products without a page are skipped (their records keep the list)."""
+    out, by_id = [], {}
+    for d in documents:
+        rec = records.get(d["product_ids"][0]) if d["type"] == "product" else None
+        entries = json.loads(rec["use_cases_json"]) if rec else []
+        if not entries:
             continue
-        names = {}                                   # normalized -> first spelling, in file order
+        out.append(use_cases_doc(d, entries))
         for e in entries:
-            names.setdefault(norm(e["name"]), e["name"].strip())
-        names.pop("", None)
-        if not names:
-            continue
-        title = f"{product['title']} Use Cases"
-        out.append({
-            "id": f"use_cases-{product['product_ids'][0]}",
-            "type": "use_cases",
-            "title": title,
-            "path": f"{product['path']}#use-cases",
-            "product_names": product["product_names"],
-            "product_ids": product["product_ids"],
-            "name_len": len(title),
-            "popularity": product["popularity"],
-            "use_case_names": list(names.values()),
-        })
-        for key_name, name in names.items():
-            by_name.setdefault(key_name, (name, []))[1].append(product)
-
-    for key_name, (name, prods) in by_name.items():
-        top = sorted(prods, key=lambda p: (-p["popularity"], p["name_len"]))[:USE_CASE_TOP_PRODUCTS]
-        out.append({
-            "id": f"use_case-{hashlib.sha1(key_name.encode('utf-8')).hexdigest()}",
-            "type": "use_case",
-            "title": name,
-            "path": f"{top[0]['path']}#use-cases",
-            "product_names": [],
-            "product_ids": [p["product_ids"][0] for p in top],
-            "name_len": len(name),
-            "popularity": len(prods),
-        })
+            by_id.setdefault(e["id"], (e["name"], []))[1].append(d)
+    out += [use_case_doc(uid, name, prods) for uid, (name, prods) in by_id.items()]
     return out
 
 
@@ -238,7 +185,16 @@ def _schema(collection_name: str) -> dict:
             {"name": "product_ids", "type": "int32[]", "facet": True},
             {"name": "name_len", "type": "int32"},
             {"name": "popularity", "type": "int32"},
-        ],
+            # catalog API lookups: products having a use case / in a category / records naming a category
+            {"name": "use_case_ids", "type": "string[]", "optional": True},
+            {"name": "category_id", "type": "string", "optional": True},
+            {"name": "category_link", "type": "string", "optional": True},
+            {"name": "category_permas", "type": "string[]", "optional": True},
+        ] + ([
+            {"name": "use_case_text", "type": "string", "optional": True, "index": False},
+            {"name": "embedding", "type": "float[]", "optional": True,   # docs without use_case_text: no vector
+             "embed": {"from": ["use_case_text"], "model_config": {"model_name": EMBED_MODEL}}},
+        ] if SEMANTIC_USE_CASES else []),
         "default_sorting_field": "popularity",
     }
 
@@ -264,16 +220,28 @@ def _delete_old_builds(keep: str) -> None:
             print(f"Deleted old collection {name}")
 
 
+def _alias_exists() -> bool:
+    try:
+        client.aliases[ALIAS].retrieve()
+        return True
+    except ObjectNotFound:
+        return False
+
+
 def main() -> None:
     if not client.operations.is_healthy():
         raise RuntimeError("Typesense is not healthy")
+    if _alias_exists() and "--force" not in sys.argv:
+        raise SystemExit(f"Alias '{ALIAS}' exists: a rebuild would discard changes made through the catalog API. "
+                         f"Re-run with --force to rebuild from the sitemaps anyway.")
 
     print("Fetching sitemap URLs...")
-    documents = build_documents()
+    records = build_records()
+    documents = build_documents(records)
     if not documents:
         raise RuntimeError("No documents were found in the configured sitemaps")
-    add_product_categories(documents)
-    documents += build_use_case_documents(documents)
+    add_product_categories(documents, records)
+    documents += build_use_case_documents(documents, records) + list(records.values())
 
     collection_name = f"{ALIAS}_build_{int(time.time())}"
     client.collections.create(_schema(collection_name))

@@ -75,9 +75,10 @@ Open <http://localhost:5500>. The frontend calls the API at `API_BASE` (top of t
 the frontend elsewhere, update `API_BASE` and add its origin to `CORS_ORIGINS`. The first indexing run downloads the configured
 sitemaps and may take some time. It builds a new collection and switches the
 search alias after a successful import, then deletes older build collections.
-Re-run `indexer.py` whenever you want to refresh the data (and after changing how
-documents are built, e.g. titles or `popularity`; restart the API afterwards, since
-category/industry aliases are cached in-process). Product popularity is
+`indexer.py` is the initial build: after that, keep the data up to date through the
+catalog API (below). A rebuild replaces the whole index and discards API changes, so
+it refuses to run while the index exists unless you pass `--force` (also needed after
+changing how documents are built; restart the API afterwards). Product popularity is
 1 + the number of comparisons a product appears in; news / customer story / alternatives
 pages inherit it from their product (vendor pages from the vendor's most popular product),
 and a comparison gets the sum of both products'. Keep the terminal
@@ -102,9 +103,10 @@ with a random API key per boot.
 3. Open the `https://<name>.onrender.com` URL once the deploy is live.
 
 Free services sleep after 15 minutes without traffic; the next visit takes about
-a minute to wake up plus the index load. To ship fresh data, re-run `indexer.py`
+a minute to wake up plus the index load. To ship fresh data, re-run `indexer.py --force`
 locally, then `.\.venv\Scripts\python.exe export_index.py`, commit the updated
-`data/documents.jsonl.gz` and push (Render redeploys automatically).
+`data/documents.jsonl.gz` and push (Render redeploys automatically). The export leaves out
+the hidden source `record` documents and the embedding vectors.
 
 ## API
 
@@ -120,6 +122,82 @@ locally, then `.\.venv\Scripts\python.exe export_index.py`, commit the updated
 
 `GET /api/health` checks Typesense connectivity.
 
+## Catalog API (create / update / delete)
+
+Changes go live immediately, and everything derived from them is updated too: popularity
+(1 + comparisons; inherited by pages and comparisons), page and comparison titles after a
+rename, each use case's top products, vendor page popularity, and product categories.
+Interactive docs: <http://127.0.0.1:8000/docs>. There is no authentication, so the write
+API is for local use only; set `CATALOG_API=0` to switch it off (the Docker image does).
+
+The API is shaped like the source data: product records as in `prod.json` (keyed by
+`CFProdCode-<id>`), use-case lists as in `product_usecases.json` (identified by their real
+UUIDs), and pages as website URLs. `POST` creates (201, or 409 if it already exists), `PATCH`
+changes part of a record, `PUT` replaces a whole list, `DELETE` removes.
+
+**Products**
+
+| Endpoint | Body |
+|---|---|
+| `POST /api/products` | `{"tool_id": "CFProdCode-99999", "name": "Acme Signals", "url": "https://www.cuspera.com/products/acme-signals-x-99999"}` (`url` optional: without it the product is stored but hidden) |
+| `GET /api/products/CFProdCode-{id}` | - (the record, its use cases, and whether it is searchable) |
+| `PATCH /api/products/CFProdCode-{id}` | `name` and/or `url` (omitted fields are kept; `"url": null` removes the page) |
+| `DELETE /api/products/CFProdCode-{id}` | - (also deletes its use cases, pages and comparisons) |
+
+**Categories and industries**
+
+| Endpoint | Body |
+|---|---|
+| `POST /api/categories`, `POST /api/industries` | `{"slug": "demand-generation", "name": "Demand Generation"}` |
+| `GET /api/categories/{slug}`, `GET /api/industries/{slug}` | - |
+| `PATCH /api/categories/{slug}`, `PATCH /api/industries/{slug}` | `{"name": "..."}` (renames) |
+| `DELETE /api/categories/{slug}`, `DELETE /api/industries/{slug}` | - |
+
+**News, customer stories, alternatives, comparisons**
+
+| Endpoint | Body |
+|---|---|
+| `POST /api/pages` | `{"type": "news\|customer-story\|alternatives\|compare", "url": "...", "title": "...", "product_ids": [...], "popularity": 5}` — one `product_ids` entry links the page to a product, two make a comparison, none a vendor page (`title`, `product_ids`, `popularity` optional) |
+| `GET /api/pages?url=...` | - (one page by URL) |
+| `DELETE /api/pages?url=...` | - |
+
+**Use cases**
+
+| Endpoint | Body |
+|---|---|
+| `PUT /api/products/CFProdCode-{id}/use-cases` | a `product_usecases.json` list: `[{"id": "<uuid>", "name": "Lead scoring"}]` (replaces it) |
+| `POST /api/products/CFProdCode-{id}/use-cases` | `{"id": "<uuid>", "name": "..."}` (appends one; returns the list) |
+| `DELETE /api/products/CFProdCode-{id}/use-cases/{uuid}` | - (removes one; returns the list) |
+| `PATCH /api/use-cases/{uuid}` | `{"name": "..."}` (renames it for every product) |
+| `DELETE /api/use-cases/{uuid}` | - (removes it from every product) |
+
+Deleting a product page (`PATCH` `"url": null`, or `DELETE /api/pages` on its URL) hides the
+product but keeps its record and use cases. Errors: 404 not found, 409 already exists,
+422 invalid input.
+
+```powershell
+$api = "http://127.0.0.1:8000/api"
+Invoke-RestMethod -Method Post "$api/products" -ContentType application/json -Body '{"tool_id": "CFProdCode-99999", "name": "Acme Signals", "url": "https://www.cuspera.com/products/acme-signals-x-99999"}'
+Invoke-RestMethod -Method Post "$api/products/CFProdCode-99999/use-cases" -ContentType application/json -Body '{"id": "62eef0e3-6428-46cb-8149-c679c47d9ab6", "name": "Lead scoring"}'
+Invoke-RestMethod -Method Post "$api/categories" -ContentType application/json -Body '{"slug": "signal-analytics", "name": "Signal Analytics"}'
+Invoke-RestMethod -Method Post "$api/pages" -ContentType application/json -Body '{"type": "news", "url": "https://www.cuspera.com/products/acme-signals-x-99999/news", "product_ids": [99999]}'
+Invoke-RestMethod -Method Delete "$api/products/CFProdCode-99999"
+```
+
 Environment overrides: `TYPESENSE_URL`, `TYPESENSE_API_KEY`,
 `TYPESENSE_COLLECTION`, `CORS_ORIGINS` (comma-separated, default
 `http://localhost:5500,http://127.0.0.1:5500`).
+
+## Semantic use-case search
+
+Use-case names (`use_case` documents) are also searched by meaning: Typesense embeds them
+with its built-in `ts/all-MiniLM-L12-v2` model at index time and embeds each query, so
+"find out which companies visit my site" finds "Website visitor identification". This is
+pure vector search (no keyword matching), closest meaning first. The first indexer run downloads
+the model (~1 minute); embedding all use cases adds a few minutes.
+
+Settings: `SEMANTIC_USE_CASES` (`1`/`0`, default `1`; the Render image sets `0`, too slow and
+too much memory on the free plan; use cases then fall back to keyword search), `EMBED_MODEL`,
+`SEMANTIC_MAX_DISTANCE` (cosine distance cut-off, default `0.45`). Changing
+`SEMANTIC_USE_CASES` or `EMBED_MODEL` requires re-running `indexer.py`; `export_index.py`
+leaves the vectors out.
