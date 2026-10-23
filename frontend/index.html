@@ -39,8 +39,6 @@
   <h1>Cuspera global search <span style="color:var(--muted);font-weight:400">(demo)</span></h1>
   <input id="q" type="search" placeholder="Try: 6sense, algolia news, canva vs fi, crm" autofocus autocomplete="off">
   <div class="chips" id="chips">
-    <label class="chip" style="cursor:pointer"><input type="checkbox" id="semantic" checked
-      style="width:auto;margin:0 5px 0 0;vertical-align:-1px">semantic use cases</label>
   </div>
   <div class="meta" id="meta"></div>
   <div id="results"></div>
@@ -53,11 +51,8 @@ const EXAMPLES = ["6s", "6sense", "6sense news", "news 6sense", "algoli", "algol
                   "algolia customer story", "canva vs fi", "canva figma", "figma and canva", "canva alternatives", "crm", "banking", "adob",
                   "hubspot use cases", "use cases cr", "lead management automation"];
 const $q = document.getElementById("q");
-const $sem = document.getElementById("semantic");
 const $meta = document.getElementById("meta");
 const $results = document.getElementById("results");
-
-$sem.addEventListener("change", () => search($q.value));   // re-run the current query with the new mode
 
 document.getElementById("chips").append(...EXAMPLES.map(t => {
   const b = document.createElement("button");
@@ -77,8 +72,7 @@ async function search(q) {
   if (q.trim().length < 2) { $meta.textContent = ""; $results.replaceChildren(); return; }
   controller = new AbortController();
   try {
-    const sem = $sem.checked ? "" : "&semantic=0";              // checked: server default (embeddings may not exist on Render)
-    const res = await fetch(API_BASE + "/api/search?q=" + encodeURIComponent(q) + sem, { signal: controller.signal });
+    const res = await fetch(API_BASE + "/api/search?q=" + encodeURIComponent(q), { signal: controller.signal });
     if (res.status === 503) timer = setTimeout(() => search($q.value), 5000);   // cold start: retry while loading
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     render(await res.json());
@@ -100,7 +94,7 @@ function render(data) {
   parts.push(data.anchor ? `anchor: <b>${esc(data.anchor)}</b> (${data.rule})` : `no confident product (${data.rule})`);
   if (data.anchor2) parts.push(`vs <b>${esc(data.anchor2)}</b>`);
   if (data.intent) parts.push(`intent: <b>${data.intent}</b>`);
-  if (data.use_cases_semantic) parts.push(`use cases: <b>semantic</b>`);
+  if (data.use_cases_semantic) parts.push(`use cases: <b>keyword + semantic</b>`);
   parts.push(`${data.took_ms} ms`);
   $meta.innerHTML = parts.join(" · ");
 

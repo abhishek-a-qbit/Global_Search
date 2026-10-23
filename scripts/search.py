@@ -490,9 +490,13 @@ def run(q: str, semantic: bool | None = None) -> dict:
                                  prefix=True, num_typos=0, per_page=2))
             keys.append(kind)
     if p["intent"] in (None, "compare") and not b and len(nq.split()) >= 2 and p["rule"] not in ("exact", "parent"):
-        searches.append(use_case_search(nq, semantic))   # 'lead management automation': a use-case name
+        searches.append(use_case_search(nq, False))   # 'lead management automation': a use-case name
         keys.append("use_case")
+        if semantic:                                # ... and, additionally, the closest meanings
+            searches.append(use_case_search(nq, True))
+            keys.append("use_case_sem")
     got = dict(zip(keys, msearch(searches)))
+    uc_sem = got.pop("use_case_sem", [])
     if not anchor and p["intent"] and p.get("entity"):   # keep the candidates' ranking: 'news cr' -> Crayon News first
         rank = {pid: i for i, pid in enumerate(p["scope"])}
         scoped = sorted(got.get(p["intent"], []), key=lambda d: min(
@@ -510,10 +514,15 @@ def run(q: str, semantic: bool | None = None) -> dict:
                              "title": f"{d['product_names'][0]}: {name}" if b else name}
                             for d in got.get("use_cases", [])
                             for k, name in enumerate(d["use_case_names"][:USE_CASES_SHOWN])]
-    uc = got.get("use_case", [])                    # semantic: closest meaning first, as returned
-    if not semantic:                                # keyword: names starting with the query first
-        uc = sorted(uc, key=lambda d: -match_tier(norm(d["title"]), nq))
-    uc = got["use_case"] = list({norm(d["title"]): d for d in reversed(uc)}.values())[::-1][:5]   # one per name
+    kw = sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))[:5]   # names starting with the query first
+    sem = uc_sem[:5]                                # closest meaning first, as returned
+    seen, uc = set(), []
+    for d in kw + sem:                              # keyword hits, then semantic ones; one per name
+        if norm(d["title"]) not in seen:
+            seen.add(norm(d["title"]))
+            uc.append(d)
+    got["use_case"] = uc
+    sem_titles = {norm(d["title"]) for d in sem}
     uc_lead = bool(uc) and match_tier(norm(uc[0]["title"]), nq) >= 2   # the query is (the start of) a use case
     uc_prods = []
     if uc_lead:                                     # ... its most popular products lead, linked to their use cases
@@ -578,7 +587,7 @@ def run(q: str, semantic: bool | None = None) -> dict:
         "intent": p["intent"],
         "anchor": anchor["title"] if anchor else None,
         "anchor2": b["title"] if b else None,
-        "use_cases_semantic": bool(semantic and uc),   # use cases matched by meaning, not words
+        "use_cases_semantic": any(norm(d["title"]) in sem_titles for d in uc),   # some use cases matched by meaning, not words
         "sections": [
             {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]]}
             for k in order if sections.get(k)
