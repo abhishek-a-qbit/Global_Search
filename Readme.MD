@@ -70,13 +70,23 @@ In a second PowerShell window, serve the frontend:
 .\.venv\Scripts\python.exe -m http.server 5500 --directory frontend
 ```
 
-Open <http://localhost:5500>. The frontend calls the API at `API_BASE` (top of the
+Open <http://localhost:5500> (FastAPI also serves the same page at <http://127.0.0.1:8000>).
+The frontend calls the API at `API_BASE` (top of the
 `<script>` in `frontend/index.html`, default `http://127.0.0.1:8000`). If you host
-the frontend elsewhere, update `API_BASE` and add its origin to `CORS_ORIGINS`. The first indexing run downloads the configured
+the frontend elsewhere, update `API_BASE` and add its origin to `CORS_ORIGINS`.
+
+The demo page shows two index builds side by side for the same query: by default the
+live build on the right and the previous one on the left (each panel has a dropdown with
+every build). Results found in only one of the two are marked with an amber bar. The
+defaults are picked when the page loads, so reload it after a rebuild.
+
+The first indexing run downloads the configured
 sitemaps and may take some time. It builds a new collection and switches the
 search alias after a successful import, then deletes older build collections.
 `indexer.py` is the initial build: after that, keep the data up to date through the
-catalog API (below). A rebuild replaces the whole index and discards API changes, so
+catalog source file or the catalog API (below). If you already have a source file
+(`data/catalog.jsonl.gz`), you can skip `indexer.py` and build from the file instead
+(`python -m scripts.source rebuild`). An `indexer.py` rebuild replaces the whole index and discards API changes, so
 it refuses to run while the index exists unless you pass `--force` (also needed after
 changing how documents are built; restart the API afterwards). Product popularity is
 1 + the number of comparisons a product appears in; news / customer story / alternatives
@@ -121,6 +131,73 @@ the hidden source `record` documents and the embedding vectors.
 ```
 
 `GET /api/health` checks Typesense connectivity.
+
+`GET /api/collections` lists the index builds (`cuspera_pages_build_<timestamp>`, newest
+first) and which one is live. `GET /api/search?q=...&collection=cuspera_pages_build_<timestamp>`
+searches that build instead of the live one (used by the side-by-side page; 404 if it does
+not exist). Optional `semantic=0|1` overrides semantic use-case search for one request.
+
+## Catalog source file (JSON Lines)
+
+The whole catalog can live in one JSON Lines file: one JSON object per line, each a
+product or a page. The file is the source of truth: it is read only when you ask for a
+sync or rebuild (nothing is synced automatically). It is set by `SOURCE_URL`: a path relative to the
+repository (default `data/catalog.jsonl.gz`, committed gzipped to keep the repository small) or an
+`http(s)` URL, e.g. the S3 object's URL; plain and gzipped files both work (detected by content).
+To edit by hand, work on a plain copy and pass it explicitly: `python -m scripts.source export
+data/catalog.jsonl` writes one from the live index (`data/catalog.jsonl` is gitignored), and
+`python -m scripts.source sync data/catalog.jsonl` reads it; export to `data/catalog.jsonl.gz`
+again before committing.
+
+| `type` | Fields |
+|---|---|
+| `product` | `id` (the number of `CFProdCode-<id>`), `name`, `url` (product page; `null` or missing: kept but not searchable), `category` (category slug shown for the product), `cat` / `cats` (`{"perma": "<category slug>", "name": "..."}` as in `prod.json`), `use_cases` (`[{"id": "<uuid>", "name": "..."}]`) |
+| `news`, `customer_story`, `alternatives` | `url`, `product_id` (missing: a vendor-level page such as `/vendors/zoom/news`) |
+| `compare` | `url`, `product_ids` (exactly two) |
+| `category`, `industry` | `url`, `title` |
+
+Pages may also set `title` and `popularity`, which replace the derived ones. Everything
+else is derived at build time, as with `indexer.py`: popularity (1 + comparisons, inherited by
+pages and comparisons), page and comparison titles from the product names, each product's
+category page, each use case's top products, and the use-case embeddings (computed by Typesense,
+the file has no vectors).
+
+```jsonl
+{"type":"product","id":17370,"name":"Canva","url":"https://www.cuspera.com/products/canva-x-17370","category":"graphic-design","cat":{"perma":"graphic-design","name":"Graphic Design"},"use_cases":[{"id":"62eef0e3-6428-46cb-8149-c679c47d9ab6","name":"Social media graphics"}]}
+{"type":"compare","url":"https://www.cuspera.com/compare/canva-vs-figma/17370/2345","product_ids":[17370,2345]}
+{"type":"news","url":"https://www.cuspera.com/products/canva-x-17370/news","product_id":17370}
+{"type":"category","url":"https://www.cuspera.com/categories/crm","title":"CRM"}
+```
+
+The file must be the complete catalog, not a list of changes: anything not in it is removed
+from search. Every line is validated first (required fields, no unknown fields, names with
+letters or digits, page URLs, no duplicate products or URLs); an invalid file changes nothing
+and the errors are listed with line numbers. A sync or rebuild also replaces any changes made
+through the catalog API that are not in the file.
+
+| Command | API | What it does |
+|---|---|---|
+| `python -m scripts.source sync --dry-run` | `POST /api/sync?dry_run=true` | Reports what a sync would create / update / delete, by document type; writes nothing |
+| `python -m scripts.source sync` | `POST /api/sync` | Writes only the documents that changed; a use case keeps its embedding unless renamed |
+| `python -m scripts.source rebuild` | `POST /api/sync?rebuild=true` | A fresh index from the file alone, in a new collection |
+| `python -m scripts.source export` | - | Writes the live index as a source file (e.g. to capture catalog API changes) |
+
+The commands take an optional file or URL instead of `SOURCE_URL`
+(`python -m scripts.source sync other.jsonl.gz`). Run them with `.\.venv\Scripts\python.exe`
+from the repository directory. The endpoint is part of the catalog API, so it is off when
+`CATALOG_API=0`. Requests block until done; with the API, `rebuild=true` takes precedence over
+`dry_run=true`, so that combination rebuilds.
+
+- A sync compares the file with the live index, which takes 2-3 minutes for the current
+  catalog (about 300k documents), plus the writes.
+- A rebuild takes about 12 minutes, mostly embedding the ~146k use cases. Search keeps using the
+  current collection until the new one is complete, then the `cuspera_pages` alias switches to it
+  in one step; if the import fails, the new collection is deleted and nothing changes. The
+  collection that was live before is kept (older ones are deleted) for comparing and rollback:
+
+```powershell
+Invoke-RestMethod -Method Put "http://127.0.0.1:8108/aliases/cuspera_pages" -Headers @{"X-TYPESENSE-API-KEY"="xyz"} -ContentType application/json -Body '{"collection_name":"cuspera_pages_build_<timestamp>"}'
+```
 
 ## Catalog API (create / update / delete)
 
@@ -186,7 +263,8 @@ Invoke-RestMethod -Method Delete "$api/products/CFProdCode-99999"
 
 Environment overrides: `TYPESENSE_URL`, `TYPESENSE_API_KEY`,
 `TYPESENSE_COLLECTION`, `CORS_ORIGINS` (comma-separated, default
-`http://localhost:5500,http://127.0.0.1:5500`).
+`http://localhost:5500,http://127.0.0.1:5500`), `SOURCE_URL` (catalog source file, default
+`data/catalog.jsonl.gz`).
 
 ## Semantic use-case search
 
@@ -199,5 +277,5 @@ the model (~1 minute); embedding all use cases adds a few minutes.
 Settings: `SEMANTIC_USE_CASES` (`1`/`0`, default `1`; the Render image sets `0`, too slow and
 too much memory on the free plan; use cases then fall back to keyword search), `EMBED_MODEL`,
 `SEMANTIC_MAX_DISTANCE` (cosine distance cut-off, default `0.45`). Changing
-`SEMANTIC_USE_CASES` or `EMBED_MODEL` requires re-running `indexer.py`; `export_index.py`
+`SEMANTIC_USE_CASES` or `EMBED_MODEL` requires re-running `indexer.py` (or a source-file rebuild); `export_index.py`
 leaves the vectors out.

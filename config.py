@@ -19,6 +19,9 @@ SEMANTIC_MAX_DISTANCE = float(os.getenv("SEMANTIC_MAX_DISTANCE", "0.45"))    # c
 
 # Catalog write API (create / update / delete). No auth: local use only; off in the Docker image.
 CATALOG_API = os.getenv("CATALOG_API", "1") == "1"
+# The catalog source file (JSON Lines, optionally gzipped) that POST /api/sync reads: a path
+# relative to the repository, or an http(s) URL (e.g. the S3 object's URL)
+SOURCE_URL = os.getenv("SOURCE_URL", "data/catalog.jsonl.gz")
 
 BASE = "https://www.cuspera.com"
 # From {BASE}/sitemap.xml, excluding directory, dimension and vendors. Entries may be

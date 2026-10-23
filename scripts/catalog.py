@@ -443,7 +443,7 @@ def delete_use_case(uid: str) -> None:
 # ---- website pages (type and url given explicitly) ---------------------------------
 def _path_of(url: str) -> str:
     path = urlsplit(url.strip()).path.rstrip("/")
-    if not path:
+    if not path.startswith("/"):                        # 'chess.com' (no scheme) is not a page url
         raise ValueError(f"Not a page URL: {url}")
     return path
 

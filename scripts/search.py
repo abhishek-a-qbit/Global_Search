@@ -1,4 +1,5 @@
 """Query understanding + grouped retrieval on top of Typesense."""
+import contextvars
 import functools
 import re
 
@@ -10,6 +11,7 @@ MAX_SPLIT_TOKENS = 6
 MAX_EXTRACT_TOKENS = 8
 MAX_SPAN_TOKENS = 4
 client = make_client(timeout_seconds=2)             # search-as-you-type: fail fast
+COLLECTION = contextvars.ContextVar("collection", default=ALIAS)   # per request: the alias, or a build to compare
 
 SECTION_LABELS = {
     "products": "Products",
@@ -59,7 +61,7 @@ def use_case_search(nq: str, semantic: bool = SEMANTIC_USE_CASES) -> dict:
 def msearch(searches: list[dict]) -> list[list[dict]]:
     if not searches:
         return []
-    response = client.multi_search.perform({"searches": [{"collection": ALIAS, "exclude_fields": HEAVY_FIELDS, **s}
+    response = client.multi_search.perform({"searches": [{"collection": COLLECTION.get(), "exclude_fields": HEAVY_FIELDS, **s}
                                                          for s in searches]})   # long lists: fetched only when shown
     out = []
     for res in response["results"]:
@@ -407,7 +409,7 @@ def _vendor_of(d: dict, kind: str, product_name: str) -> bool:
 
 
 @functools.cache
-def topic_aliases() -> dict[str, list[dict]]:
+def topic_aliases(collection: str = ALIAS) -> dict[str, list[dict]]:
     """alias -> category/industry docs. Aliases: title initials ('abm') + TOPIC_ALIASES."""
     docs, page = [], 1
     while True:
@@ -432,7 +434,7 @@ def topic_aliases() -> dict[str, list[dict]]:
 def topic_alias_hits(nq: str):
     """(exact, inner, partial) alias matches: the whole query, a phrase inside it ('abm software'),
     or a multi-word alias being typed ('customer rel'). Inner skips 2-letter aliases ('it', 'pr')."""
-    aliases = topic_aliases()
+    aliases = topic_aliases(COLLECTION.get())
     toks = nq.split()
     spans = [" ".join(toks[i:j]) for i in range(len(toks))
              for j in range(i + 1, min(len(toks), i + MAX_SPAN_TOKENS) + 1)]
@@ -441,7 +443,16 @@ def topic_alias_hits(nq: str):
     return aliases.get(nq, []), inner, partial
 
 
-def run(q: str, semantic: bool | None = None) -> dict:
+def run(q: str, semantic: bool | None = None, collection: str | None = None) -> dict:
+    """collection: search this collection instead of the alias (side-by-side comparison of builds)."""
+    token = COLLECTION.set(collection or ALIAS)
+    try:
+        return _run(q, semantic)
+    finally:
+        COLLECTION.reset(token)
+
+
+def _run(q: str, semantic: bool | None = None) -> dict:
     semantic = SEMANTIC_USE_CASES if semantic is None else semantic
     nq = norm(q)
     if len(nq) < MIN_CHARS:

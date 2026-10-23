@@ -5,3 +5,4 @@ __pycache__/
 .env
 ts-data/
 product_usecases.json
+data/catalog.jsonl

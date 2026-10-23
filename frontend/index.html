@@ -5,43 +5,53 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cuspera search demo</title>
 <style>
-  :root { --bg:#f7f7f8; --card:#fff; --text:#1c1c1e; --muted:#6b6b72; --line:#e4e4e8; --accent:#4f46e5; }
+  :root { --bg:#f7f7f8; --card:#fff; --text:#1c1c1e; --muted:#6b6b72; --line:#e4e4e8; --accent:#4f46e5; --diff:#f59e0b; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#141417; --card:#1d1d21; --text:#ececef; --muted:#9a9aa3; --line:#2c2c32; --accent:#818cf8; }
+    :root { --bg:#141417; --card:#1d1d21; --text:#ececef; --muted:#9a9aa3; --line:#2c2c32; --accent:#818cf8; --diff:#fbbf24; }
   }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--text);
          font:15px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-  main { max-width:720px; margin:48px auto; padding:0 16px; }
+  main { max-width:1280px; margin:40px auto; padding:0 16px; }
   h1 { font-size:20px; margin:0 0 16px; }
-  input { width:100%; padding:14px 16px; font-size:17px; border:1px solid var(--line);
-          border-radius:12px; background:var(--card); color:var(--text); outline:none; }
-  input:focus { border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+  #q { width:100%; padding:14px 16px; font-size:17px; border:1px solid var(--line);
+       border-radius:12px; background:var(--card); color:var(--text); outline:none; }
+  #q:focus { border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
   .chips { margin:10px 0 4px; display:flex; flex-wrap:wrap; gap:6px; }
   .chip { border:1px solid var(--line); background:var(--card); color:var(--muted); border-radius:999px;
           padding:3px 10px; font-size:13px; cursor:pointer; }
   .chip:hover { color:var(--text); border-color:var(--accent); }
+  .panes { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:14px; }
+  @media (max-width: 860px) { .panes { grid-template-columns:1fr; } }
+  .pane select { width:100%; padding:8px 10px; font-size:14px; border:1px solid var(--line); border-radius:10px;
+                 background:var(--card); color:var(--text); }
   .meta { color:var(--muted); font-size:13px; margin:10px 2px; min-height:18px; }
   .meta b { color:var(--text); font-weight:600; }
   .section { background:var(--card); border:1px solid var(--line); border-radius:12px; margin:12px 0; overflow:hidden; }
   .section h2 { font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
                 margin:0; padding:10px 14px; border-bottom:1px solid var(--line); }
-  .item { display:block; padding:10px 14px; text-decoration:none; color:inherit; border-bottom:1px solid var(--line); }
+  .item { display:block; padding:10px 14px; text-decoration:none; color:inherit; border-bottom:1px solid var(--line);
+          border-left:3px solid transparent; }
   .item:last-child { border-bottom:0; }
   .item:hover { background:color-mix(in srgb, var(--accent) 8%, transparent); }
+  .item.only { border-left-color:var(--diff); }
   .title { font-weight:600; }
   .path { color:var(--muted); font-size:12.5px; word-break:break-all; }
   .empty { color:var(--muted); padding:24px 4px; text-align:center; }
+  .legend { color:var(--muted); font-size:12.5px; }
+  .legend i { display:inline-block; width:3px; height:12px; background:var(--diff); vertical-align:-1px; margin-right:5px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>Cuspera global search <span style="color:var(--muted);font-weight:400">(demo)</span></h1>
+  <h1>Cuspera global search <span style="color:var(--muted);font-weight:400">(demo: collections side by side)</span></h1>
   <input id="q" type="search" placeholder="Try: 6sense, algolia news, canva vs fi, crm" autofocus autocomplete="off">
-  <div class="chips" id="chips">
+  <div class="chips" id="chips"></div>
+  <div class="legend"><i></i>result not in the other collection's results</div>
+  <div class="panes">
+    <section class="pane" id="pane-0"><select></select><div class="meta"></div><div class="results"></div></section>
+    <section class="pane" id="pane-1"><select></select><div class="meta"></div><div class="results"></div></section>
   </div>
-  <div class="meta" id="meta"></div>
-  <div id="results"></div>
 </main>
 
 <script>
@@ -51,35 +61,68 @@ const EXAMPLES = ["6s", "6sense", "6sense news", "news 6sense", "algoli", "algol
                   "algolia customer story", "canva vs fi", "canva figma", "figma and canva", "canva alternatives", "crm", "banking", "adob",
                   "hubspot use cases", "use cases cr", "lead management automation"];
 const $q = document.getElementById("q");
-const $meta = document.getElementById("meta");
-const $results = document.getElementById("results");
+const panes = [0, 1].map(i => {
+  const root = document.getElementById("pane-" + i);
+  return { select: root.querySelector("select"), meta: root.querySelector(".meta"),
+           results: root.querySelector(".results"), controller: null, data: null };
+});
 
 document.getElementById("chips").append(...EXAMPLES.map(t => {
   const b = document.createElement("button");
   b.className = "chip"; b.textContent = t;
-  b.onclick = () => { $q.value = t; search(t); $q.focus(); };
+  b.onclick = () => { $q.value = t; searchAll(t); $q.focus(); };
   return b;
 }));
 
-let timer, controller;
+let timer;
 $q.addEventListener("input", () => {
   clearTimeout(timer);
-  timer = setTimeout(() => search($q.value), 150);          // debounce
+  timer = setTimeout(() => searchAll($q.value), 150);       // debounce
 });
+panes.forEach(p => p.select.addEventListener("change", () => search(p, $q.value)));
 
-async function search(q) {
-  if (controller) controller.abort();                        // cancel stale request
-  if (q.trim().length < 2) { $meta.textContent = ""; $results.replaceChildren(); return; }
-  controller = new AbortController();
+// Left: the previous build, right: the live one (both the live one if there is only one build).
+// Previous = the newest build older than the live one: a newer one may still be being built.
+async function loadCollections() {
   try {
-    const res = await fetch(API_BASE + "/api/search?q=" + encodeURIComponent(q), { signal: controller.signal });
-    if (res.status === 503) timer = setTimeout(() => search($q.value), 5000);   // cold start: retry while loading
+    const res = await fetch(API_BASE + "/api/collections");
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    render(await res.json());
+    const { collections } = await res.json();               // newest first
+    const live = collections.find(c => c.live) || collections[0];
+    const other = collections.find(c => c !== live && c.created_at < live.created_at)
+               || collections.find(c => c !== live) || live;
+    panes.forEach((p, i) => {
+      p.select.replaceChildren(...collections.map(c => {
+        const o = el("option", "", `${c.live ? "LIVE · " : ""}${c.name} · ${new Date(c.created_at * 1000).toLocaleString()} · ${c.documents.toLocaleString()} docs`);
+        o.value = c.name;
+        return o;
+      }));
+      p.select.value = (i === 0 ? other : live).name;
+    });
+  } catch (e) {
+    panes.forEach(p => p.meta.textContent = "Could not list collections: " + e.message);
+  }
+}
+
+function searchAll(q) { panes.forEach(p => search(p, q)); }
+
+async function search(p, q) {
+  if (p.controller) p.controller.abort();                    // cancel stale request
+  if (q.trim().length < 2) { p.data = null; p.meta.textContent = ""; p.results.replaceChildren(); return; }
+  p.controller = new AbortController();
+  const coll = p.select.value ? "&collection=" + encodeURIComponent(p.select.value) : "";
+  try {
+    const res = await fetch(API_BASE + "/api/search?q=" + encodeURIComponent(q) + coll, { signal: p.controller.signal });
+    if (res.status === 503) setTimeout(() => search(p, $q.value), 5000);   // cold start: retry while loading
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    p.data = await res.json();
   } catch (e) {
     if (e.name === "AbortError") return;
-    $meta.textContent = ""; $results.replaceChildren(el("div", "empty", "Error: " + e.message));
+    p.data = null;
+    p.meta.textContent = ""; p.results.replaceChildren(el("div", "empty", "Error: " + e.message));
+    return;
   }
+  panes.forEach(render);                                     // re-mark differences in both panes
 }
 
 function el(tag, cls, text) {
@@ -89,24 +132,29 @@ function el(tag, cls, text) {
   return n;
 }
 
-function render(data) {
+function render(p) {
+  const data = p.data;
+  if (!data) return;
+  const other = panes.find(x => x !== p).data;
+  const otherUrls = other ? new Set(other.sections.flatMap(s => s.items.map(it => s.key + " " + it.url))) : null;
   const parts = [];
   parts.push(data.anchor ? `anchor: <b>${esc(data.anchor)}</b> (${data.rule})` : `no confident product (${data.rule})`);
   if (data.anchor2) parts.push(`vs <b>${esc(data.anchor2)}</b>`);
   if (data.intent) parts.push(`intent: <b>${data.intent}</b>`);
   if (data.use_cases_semantic) parts.push(`use cases: <b>keyword + semantic</b>`);
   parts.push(`${data.took_ms} ms`);
-  $meta.innerHTML = parts.join(" · ");
+  p.meta.innerHTML = parts.join(" · ");
 
   if (!data.sections.length) {
-    $results.replaceChildren(el("div", "empty", "No results"));
+    p.results.replaceChildren(el("div", "empty", "No results"));
     return;
   }
-  $results.replaceChildren(...data.sections.map(sec => {
+  p.results.replaceChildren(...data.sections.map(sec => {
     const box = el("div", "section");
     box.append(el("h2", "", sec.label));
     sec.items.forEach(it => {
-      const a = el("a", "item"); a.href = it.url; a.target = "_blank"; a.rel = "noopener";
+      const only = otherUrls && other.query === data.query && !otherUrls.has(sec.key + " " + it.url);
+      const a = el("a", "item" + (only ? " only" : "")); a.href = it.url; a.target = "_blank"; a.rel = "noopener";
       a.append(el("div", "title", it.title), el("div", "path", it.path));
       box.append(a);
     });
@@ -115,6 +163,8 @@ function render(data) {
 }
 
 function esc(s) { return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+loadCollections();
 </script>
 </body>
 </html>

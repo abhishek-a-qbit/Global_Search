@@ -6,10 +6,11 @@
 Changes are live at once; derived data (popularity, titles, use-case top products, categories) is kept in sync."""
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Path, Query, Response
+from fastapi import APIRouter, HTTPException, Path, Query, Response
 from pydantic import BaseModel, Field
 
-from scripts import catalog
+from config import SOURCE_URL
+from scripts import catalog, source
 
 router = APIRouter(prefix="/api")
 ToolId = Annotated[str, Path(pattern=r"^CFProdCode-\d+$", examples=["CFProdCode-17370"])]
@@ -201,3 +202,17 @@ def remove_page(url: PageUrl):
     """Remove a website page by URL."""
     catalog.remove_page(url)
     return Response(status_code=204)
+
+
+# ---- source file sync -------------------------------------------------------------------------
+@router.post("/sync", tags=["sync"])
+def sync_source(dry_run: bool = Query(False, description="Only report what would change"),
+                rebuild: bool = Query(False, description="A fresh index from the file alone (slower: "
+                                                         "every use case is embedded again)")):
+    """Make the index match the catalog source file (SOURCE_URL: JSON Lines, see scripts/source.py).
+    Only changed documents are written; the file replaces changes made through this API.
+    An invalid file changes nothing (422, with the first errors)."""
+    try:
+        return source.rebuild(SOURCE_URL) if rebuild else source.sync(SOURCE_URL, dry_run=dry_run)
+    except OSError as e:                               # file missing / URL unreachable
+        raise HTTPException(502, f"Cannot read the source file {SOURCE_URL}: {e}")

@@ -7,7 +7,7 @@ from typesense.exceptions import ObjectNotFound, TypesenseClientError
 
 from config import ALIAS, make_client
 from export_index import EXPORT_FILE
-from indexer import _schema
+from scripts.source import schema as _schema
 
 BATCH_LINES = 2000                                   # streamed: keeps memory low on a 512 MB instance
 client = make_client(timeout_seconds=300)
