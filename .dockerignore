@@ -6,3 +6,7 @@ ts-data
 *.py[cod]
 .env
 _probe.py
+product_usecases.json
+prod.json
+product_categories.json
+data/catalog.jsonl
