@@ -5,5 +5,28 @@ services:
     ports:
       - "127.0.0.1:8108:8108"
     volumes:
-      - ./ts-data:/data
+      - typesense-data:/data   # a Docker volume (inside the VM): a Windows / OneDrive folder is far too slow
     command: "--data-dir /data --api-key=${TYPESENSE_API_KEY:-xyz} --enable-cors"
+
+  # The API (and demo page) in the same VM: its Typesense calls stay on the Docker network
+  # instead of crossing from Windows on every request. Code is mounted; edits reload.
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - typesense
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      TYPESENSE_URL: http://typesense:8108
+      TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-xyz}
+      WATCHFILES_FORCE_POLLING: "true"     # file events do not cross a Windows bind mount
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --reload-dir scripts
+
+volumes:
+  typesense-data:

@@ -75,11 +75,6 @@ The frontend calls the API at `API_BASE` (top of the
 `<script>` in `frontend/index.html`, default `http://127.0.0.1:8000`). If you host
 the frontend elsewhere, update `API_BASE` and add its origin to `CORS_ORIGINS`.
 
-The demo page shows two index builds side by side for the same query: by default the
-live build on the right and the previous one on the left (each panel has a dropdown with
-every build). Results found in only one of the two are marked with an amber bar. The
-defaults are picked when the page loads, so reload it after a rebuild.
-
 The first indexing run downloads the configured
 sitemaps and may take some time. It builds a new collection and switches the
 search alias after a successful import, then deletes older build collections.
@@ -134,7 +129,7 @@ the hidden source `record` documents and the embedding vectors.
 
 `GET /api/collections` lists the index builds (`cuspera_pages_build_<timestamp>`, newest
 first) and which one is live. `GET /api/search?q=...&collection=cuspera_pages_build_<timestamp>`
-searches that build instead of the live one (used by the side-by-side page; 404 if it does
+searches that build instead of the live one (e.g. to compare with the previous build; 404 if it does
 not exist). Optional `semantic=0|1` overrides semantic use-case search for one request.
 
 ## Catalog source file (JSON Lines)
