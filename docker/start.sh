@@ -7,5 +7,21 @@ mkdir -p /tmp/ts-data
 
 typesense-server --data-dir /tmp/ts-data --api-key="$TYPESENSE_API_KEY" \
   --listen-address 127.0.0.1 --api-port 8108 &
-python seed_index.py &
-exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-10000}"
+
+(
+  python - <<'EOF'
+import time
+from config import make_client
+c = make_client(timeout_seconds=5)
+for _ in range(300):
+    try:
+        if c.operations.is_healthy():
+            break
+    except Exception:
+        pass
+    time.sleep(1)
+EOF
+  python -m scripts.source rebuild data/catalog.jsonl.gz
+) &
+
+exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-7860}"

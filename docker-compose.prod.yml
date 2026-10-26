@@ -1,0 +1,12 @@
+# Production on a single VM (e.g. Oracle Cloud Always Free): one container with Typesense + API + frontend.
+#   docker compose -f docker-compose.prod.yml up -d --build
+# The index is rebuilt from data/catalog.jsonl.gz at every start (about 30 s).
+services:
+  search:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "80:7860"
+    environment:
+      PORT: "7860"
+      TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-}
