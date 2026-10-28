@@ -1,0 +1,11 @@
+{
+	auto_https disable_redirects
+}
+
+http://:80 {
+	reverse_proxy search:7860
+}
+
+{$DOMAIN} {
+	reverse_proxy search:7860
+}

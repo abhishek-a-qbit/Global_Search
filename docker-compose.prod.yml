@@ -1,4 +1,5 @@
-# Production on a single VM (e.g. Oracle Cloud Always Free / trial): the app container plus Caddy for HTTPS.
+# Production on a single VM (e.g. Oracle Cloud Always Free / trial): the app container plus Caddy, serving
+# plain HTTP on any host and HTTPS on $DOMAIN.
 #   echo "DOMAIN=your-name.duckdns.org" > .env
 #   docker compose -f docker-compose.prod.yml up -d --build
 # The first start builds the index from data/catalog.jsonl.gz and embeds every use case (can take an hour);
@@ -21,9 +22,11 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
     volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
-    command: caddy reverse-proxy --from ${DOMAIN:?set DOMAIN in .env} --to search:7860
 
 volumes:
   typesense-data:
