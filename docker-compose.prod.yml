@@ -1,11 +1,14 @@
 # Production on a single VM (e.g. Oracle Cloud Always Free / trial): the app container plus Caddy for HTTPS.
 #   echo "DOMAIN=your-name.duckdns.org" > .env
 #   docker compose -f docker-compose.prod.yml up -d --build
-# The index is rebuilt from data/catalog.jsonl.gz at every start (about 30 s).
+# The first start builds the index from data/catalog.jsonl.gz and embeds every use case (can take an hour);
+# it is kept on the typesense-data volume, so later restarts take seconds.
 services:
   search:
     build: .
     restart: unless-stopped
+    volumes:
+      - typesense-data:/data
     environment:
       PORT: "7860"
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-}
@@ -23,4 +26,5 @@ services:
     command: caddy reverse-proxy --from ${DOMAIN:?set DOMAIN in .env} --to search:7860
 
 volumes:
+  typesense-data:
   caddy-data:

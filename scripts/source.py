@@ -36,7 +36,7 @@ from scripts.Textutil import norm, pretty
 ROOT = Path(__file__).resolve().parents[1]
 BATCH_SIZE = 1000
 MAX_ERRORS = 20
-client = make_client(timeout_seconds=300)            # imports embed new use cases: can be slow
+client = make_client(timeout_seconds=1800)           # imports embed new use cases (and the first one downloads the model): can be slow
 
 
 # ---- file format ------------------------------------------------------------------------------
