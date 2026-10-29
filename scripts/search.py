@@ -495,10 +495,11 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             searches.append(dict(q=entity, query_by="title", filter_by=f"type:={p['intent']}", prefix=True,
                                  num_typos=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=10))
             keys.append("intent_titles")
-    if not p["intent"] and len(nq) >= 3:
+    if (not p["intent"] or (p["intent"] == "compare" and not anchor)) and len(nq) >= 3:
         for kind in TOPIC_TYPES:
             searches.append(dict(q=nq, query_by="title", filter_by=f"type:={kind}",
-                                 prefix=True, num_typos=0, per_page=2))
+                                 prefix=True, num_typos=0, per_page=2,
+                                 **({"drop_tokens_threshold": 0} if p["intent"] else {})))
             keys.append(kind)
     if p["intent"] in (None, "compare") and not b and len(nq.split()) >= 2 and p["rule"] not in ("exact", "parent"):
         searches.append(use_case_search(nq, False))   # 'lead management automation': a use-case name
@@ -557,6 +558,9 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                  for d in (anchor, b) if d and d.get("category_id")]
     if prod_cats:                                   # the product's category (in a comparison: both, if different)
         got["category"] = _dedupe(prod_cats + got.get("category", []))
+    if not anchor and p["intent"] == "compare" and any(norm(c["title"]) == nq for kind in TOPIC_TYPES for c in got.get(kind, [])):
+        got.pop("compare", None)                    # 'collaboration and productivity': a category name, not 2 products
+        p = {**p, "intent": None}
 
     if p.get("e2") and (b or p["pair"] or p["partners"]):
         if p["pair"] or not b:
