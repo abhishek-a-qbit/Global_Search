@@ -431,23 +431,6 @@ def topic_aliases(collection: str = ALIAS) -> dict[str, list[dict]]:
     return out
 
 
-CATEGORY_PRODUCTS, RECORD_PAGES = 10, 4
-
-
-def category_products(cats: list[dict]) -> list[dict]:
-    """The most popular products (popularity = 1 + comparisons) of some categories, found through the
-    products' records, which list their main and extra categories."""
-    permas = ",".join(f"`{p}`" for c in cats for p in {c["path"].rstrip("/").rsplit("/", 1)[-1],
-                                                      c["path"].rstrip("/").rsplit("/", 1)[-1].removesuffix("s")})
-    pages = msearch([dict(q="*", filter_by=f"type:=record && category_permas:[{permas}]", include_fields="product_ids",
-                          per_page=250, page=n) for n in range(1, RECORD_PAGES + 1)])
-    ids = {d["product_ids"][0] for page in pages for d in page}
-    if not ids:
-        return []
-    return msearch([dict(q="*", filter_by=f"type:=product && product_ids:[{','.join(map(str, ids))}]",
-                         sort_by="popularity:desc", per_page=CATEGORY_PRODUCTS)])[0]
-
-
 def topic_alias_hits(nq: str):
     """(exact, inner, partial) alias matches: the whole query, a phrase inside it ('abm software'),
     or a multi-word alias being typed ('customer rel'). Inner skips 2-letter aliases ('it', 'pr')."""
@@ -599,10 +582,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
     # automation' -> the product named that way still comes first; a loose match ('sales and marketing ali') does not
     prods = lead + [d for d in uc_prods if d["id"] not in {x["id"] for x in lead}] + \
         [h for h in prods[len(lead):] if h["id"] not in uc_ids]
-    exact_cats = [c for c in got.get("category", []) if norm(c["title"]) == nq or c["id"] in alias_ids]
-    top = category_products(exact_cats) if exact_cats else []   # 'crm', 'abm': the category's top products, in a section of their own
-    sections = {"products": prods, **got, "category_products": top}
-    labels = {**SECTION_LABELS, "category_products": "Top products in " + " / ".join(c["title"] for c in exact_cats)}
+    sections = {"products": prods, **got}
 
     order = ["products", "category", *PRODUCT_PAGE_TYPES, "compare", "industry", "use_case"]
     if p["intent"]:
@@ -615,7 +595,6 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         if any(norm(c["title"]) == nq or c["id"] in alias_ids for c in got.get(kind, [])):
             order.remove(kind)
             order.insert(0, kind)
-    order.insert(order.index("category") + 1, "category_products")
 
     return {
         "query": q,
@@ -625,7 +604,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         "anchor2": b["title"] if b else None,
         "use_cases_semantic": any(norm(d["title"]) in sem_titles for d in uc),   # some use cases matched by meaning, not words
         "sections": [
-            {"key": k, "label": labels[k], "items": [_item(d) for d in sections[k]]}
+            {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]]}
             for k in order if sections.get(k)
         ],
     }
