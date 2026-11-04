@@ -26,7 +26,8 @@ SECTION_LABELS = {
 }
 PRODUCT_PAGE_TYPES = ("news", "customer_story", "alternatives", "use_cases")   # one page per product
 VENDOR_PAGE_TYPES = ("news", "customer_story", "alternatives")                # ... also per vendor
-USE_CASES_SHOWN = 10                                                            # names listed per product
+USE_CASES_SHOWN = 10                                                            # names listed per product on '... use cases'
+USE_CASES_PREVIEW = 5                                                           # ... on a plain product search
 TOPIC_TYPES = ("category", "industry")                             # matched by title
 TOPIC_ALIASES = {        # extra names for categories / industries, keyed by normalized title
     "crm": ["customer relationship management"],
@@ -466,7 +467,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         aid = anchor["product_ids"][0]
         for i, prod in enumerate([anchor] + ([b] if b else [])):   # group info for both products
             for kind in PRODUCT_PAGE_TYPES:
-                names = kind == "use_cases" and p["intent"] == "use_cases"   # 'salesforce use cases': list them
+                names = kind == "use_cases"                                # its use-case names: listed as links
                 searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={prod['product_ids'][0]}",
                                      per_page=1, **({"exclude_fields": "use_case_text,embedding,use_case_ids"}
                                                     if names else {})))
@@ -521,11 +522,12 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             if prod and not own:                    # no page of its own: 'Demandbase One' -> Demandbase News
                 own = [d for d in vendor if _vendor_of(d, kind, norm(prod["product_names"][0]))][:1]
             got[kind] = got.get(kind, []) + own
-    if anchor and p["intent"] == "use_cases":       # one link per name, to the product page's use-case section
+    if anchor:                                      # one link per name, to the product page's use-case section
+        shown = USE_CASES_SHOWN if p["intent"] == "use_cases" else USE_CASES_PREVIEW
         got["use_cases"] = [{"id": f"{d['id']}-{k}", "path": d["path"], "type": "use_case",
                              "title": f"{d['product_names'][0]}: {name}" if b else name}
                             for d in got.get("use_cases", [])
-                            for k, name in enumerate(d["use_case_names"][:USE_CASES_SHOWN])]
+                            for k, name in enumerate(d.get("use_case_names", [])[:shown])]
     kw = sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))[:5]   # names starting with the query first
     sem = uc_sem[:5]                                # closest meaning first, as returned
     seen, uc = set(), []
