@@ -28,6 +28,8 @@ PRODUCT_PAGE_TYPES = ("news", "customer_story", "alternatives", "use_cases")   #
 VENDOR_PAGE_TYPES = ("news", "customer_story", "alternatives")                # ... also per vendor
 USE_CASES_SHOWN = 10                                                            # names listed per product on '... use cases'
 USE_CASES_PREVIEW = 5                                                           # ... on a plain product search
+USE_CASES_AMBIGUOUS = 3                                                         # ... per candidate, no confident product
+AMBIGUOUS_FOCUS = 2                                                             # candidates whose own pages are shown
 TOPIC_TYPES = ("category", "industry")                             # matched by title
 TOPIC_ALIASES = {        # extra names for categories / industries, keyed by normalized title
     "crm": ["customer relationship management"],
@@ -399,6 +401,15 @@ def _dedupe(docs):
     return list({d["id"]: d for d in docs}.values())
 
 
+def _drop_focus_pages(got: dict, focus: list, intent) -> list:
+    """Removes the top candidates' own pages (not the intent's, listed for every candidate); returns no focus."""
+    if focus:
+        for kind in PRODUCT_PAGE_TYPES:
+            if kind != intent:
+                got.pop(kind, None)
+    return []
+
+
 PAGE_TITLE_SUFFIX = {"news": "news", "customer_story": "customer stories", "alternatives": "alternatives",
                      "use_cases": "use cases"}
 
@@ -463,19 +474,23 @@ def _run(q: str, semantic: bool | None = None) -> dict:
     anchor, b, hits = p["anchor"], p.get("anchor2"), p["hits"]
 
     searches, keys = [], []
+    focus = ([anchor] + ([b] if b else [])) if anchor else \
+        hits[:AMBIGUOUS_FOCUS] if p["rule"] == "ambiguous" else []   # whose own pages are shown
+    for i, prod in enumerate(focus):                # group info for both products / the top candidates
+        for kind in PRODUCT_PAGE_TYPES:
+            if not anchor and kind == p["intent"]:  # 'news cr': already listed for every candidate
+                continue
+            names = kind == "use_cases"                                    # its use-case names: listed as links
+            searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={prod['product_ids'][0]}",
+                                 per_page=1, **({"exclude_fields": "use_case_text,embedding,use_case_ids"}
+                                                if names else {})))
+            keys.append(f"{kind}_{i}")
+            if kind in VENDOR_PAGE_TYPES:
+                searches.append(dict(q=norm(prod["product_names"][0]).split()[0], query_by="title",
+                                     filter_by=f"type:={kind}", num_typos=0, prefix=False, per_page=10))
+                keys.append(f"{kind}_vendor_{i}")
     if anchor:
         aid = anchor["product_ids"][0]
-        for i, prod in enumerate([anchor] + ([b] if b else [])):   # group info for both products
-            for kind in PRODUCT_PAGE_TYPES:
-                names = kind == "use_cases"                                # its use-case names: listed as links
-                searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={prod['product_ids'][0]}",
-                                     per_page=1, **({"exclude_fields": "use_case_text,embedding,use_case_ids"}
-                                                    if names else {})))
-                keys.append(f"{kind}_{i}")
-                if kind in VENDOR_PAGE_TYPES:
-                    searches.append(dict(q=norm(prod["product_names"][0]).split()[0], query_by="title",
-                                         filter_by=f"type:={kind}", num_typos=0, prefix=False, per_page=10))
-                    keys.append(f"{kind}_vendor_{i}")
         if not p.get("e2") or not (b or p["pair"] or p["partners"]):   # nothing matched the 2nd side: show anchor's
             searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={aid}",
                                  sort_by="popularity:desc", per_page=5))
@@ -496,10 +511,16 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             searches.append(dict(q=entity, query_by="title", filter_by=f"type:={p['intent']}", prefix=True,
                                  num_typos=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=10))
             keys.append("intent_titles")
-    short = len(nq) < 3                             # 'cr': a wider pool, re-ranked below (title starts with it first)
     if not p["intent"] or (p["intent"] == "compare" and not anchor):
+        topic_q = nq
+    elif not anchor and p["intent"] not in TOPIC_TYPES:   # 'usecase crm': the entity's categories / industries too
+        topic_q = p.get("entity")
+    else:
+        topic_q = None
+    short = bool(topic_q) and len(topic_q) < 3      # 'cr': a wider pool, re-ranked below (title starts with it first)
+    if topic_q:
         for kind in TOPIC_TYPES:
-            searches.append(dict(q=nq, query_by="title", filter_by=f"type:={kind}",
+            searches.append(dict(q=topic_q, query_by="title", filter_by=f"type:={kind}",
                                  prefix=True, num_typos=0, per_page=10 if short else 2,
                                  **({"sort_by": "_text_match:desc,name_len:asc"} if short else {}),
                                  **({"drop_tokens_threshold": 0} if p["intent"] else {})))
@@ -514,7 +535,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
     uc_sem = got.pop("use_case_sem", [])
     if short:
         for kind in TOPIC_TYPES:
-            got[kind] = sorted(got.get(kind, []), key=lambda d: -match_tier(norm(d["title"]), nq))[:2]
+            got[kind] = sorted(got.get(kind, []), key=lambda d: -match_tier(norm(d["title"]), topic_q))[:2]
     if not anchor and p["intent"] and p.get("entity"):   # keep the candidates' ranking: 'news cr' -> Crayon News first
         rank = {pid: i for i, pid in enumerate(p["scope"])}
         scoped = sorted(got.get(p["intent"], []), key=lambda d: min(
@@ -522,15 +543,15 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         got[p["intent"]] = sorted(_dedupe(scoped + got.pop("intent_titles")),
                                   key=lambda d: -match_tier(norm(d["title"]), p["entity"]))[:5]
     for kind in PRODUCT_PAGE_TYPES:
-        for i, prod in enumerate([anchor, b] if anchor else []):
+        for i, prod in enumerate(focus):
             own, vendor = got.pop(f"{kind}_{i}", []), got.pop(f"{kind}_vendor_{i}", [])
-            if prod and not own:                    # no page of its own: 'Demandbase One' -> Demandbase News
+            if not own:                             # no page of its own: 'Demandbase One' -> Demandbase News
                 own = [d for d in vendor if _vendor_of(d, kind, norm(prod["product_names"][0]))][:1]
-            got[kind] = got.get(kind, []) + own
-    if anchor:                                      # one link per name, to the product page's use-case section
-        shown = USE_CASES_SHOWN if p["intent"] == "use_cases" else USE_CASES_PREVIEW
+            got[kind] = _dedupe(got.get(kind, []) + own)   # two candidates may share a vendor page
+    if focus and (anchor or p["intent"] != "use_cases"):   # one link per name, to the product page's use-case section
+        shown = USE_CASES_SHOWN if p["intent"] == "use_cases" else USE_CASES_PREVIEW if anchor else USE_CASES_AMBIGUOUS
         got["use_cases"] = [{"id": f"{d['id']}-{k}", "path": d["path"], "type": "use_case",
-                             "title": f"{d['product_names'][0]}: {name}" if b else name}
+                             "title": f"{d['product_names'][0]}: {name}" if len(focus) > 1 else name}
                             for d in got.get("use_cases", [])
                             for k, name in enumerate(d.get("use_case_names", [])[:shown])]
     kw = sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))[:5]   # names starting with the query first
@@ -552,6 +573,8 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         if not anchor and p["intent"] == "compare":    # 'customer engagement and retention': not 2 products
             got.pop("compare", None)
             p = {**p, "intent": None}
+        if not anchor:                              # these products lead, not the candidates: drop the candidates' pages
+            focus = _drop_focus_pages(got, focus, p["intent"])
     alias_exact, alias_inner, alias_partial = topic_alias_hits(nq)
     if not anchor:                                  # 'abm xyz': nothing else matched, the abbreviation leads
         alias_exact = alias_exact + alias_inner
@@ -561,10 +584,13 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         if exact or partial:
             got[kind] = _dedupe(exact + got.get(kind, []) + partial)[:max(2, len(exact))]
     alias_ids = {d["id"] for d in alias_exact}
+    if not anchor and any(norm(c["title"]) == nq or c["id"] in alias_ids for kind in TOPIC_TYPES for c in got.get(kind, [])):
+        focus = _drop_focus_pages(got, focus, p["intent"])   # 'crm', 'banking': the topic is the answer
     prod_cats = [{"id": d["category_id"], "title": d["category_title"], "path": d["category_path"], "type": "category"}
-                 for d in (anchor, b) if d and d.get("category_id")]
-    if prod_cats:                                   # the product's category (in a comparison: both, if different)
-        got["category"] = _dedupe(prod_cats + got.get("category", []))
+                 for d in focus if d.get("category_id")]
+    if prod_cats:                                   # the product's category (in a comparison: both, if different);
+        got["category"] = _dedupe(prod_cats + got.get("category", []) if anchor   # the candidates': after the
+                                  else got.get("category", []) + prod_cats)       # categories matching the query
     if not anchor and p["intent"] == "compare" and any(norm(c["title"]) == nq for kind in TOPIC_TYPES for c in got.get(kind, [])):
         got.pop("compare", None)                    # 'collaboration and productivity': a category name, not 2 products
         p = {**p, "intent": None}
