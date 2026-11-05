@@ -496,10 +496,12 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             searches.append(dict(q=entity, query_by="title", filter_by=f"type:={p['intent']}", prefix=True,
                                  num_typos=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=10))
             keys.append("intent_titles")
-    if (not p["intent"] or (p["intent"] == "compare" and not anchor)) and len(nq) >= 3:
+    short = len(nq) < 3                             # 'cr': a wider pool, re-ranked below (title starts with it first)
+    if not p["intent"] or (p["intent"] == "compare" and not anchor):
         for kind in TOPIC_TYPES:
             searches.append(dict(q=nq, query_by="title", filter_by=f"type:={kind}",
-                                 prefix=True, num_typos=0, per_page=2,
+                                 prefix=True, num_typos=0, per_page=10 if short else 2,
+                                 **({"sort_by": "_text_match:desc,name_len:asc"} if short else {}),
                                  **({"drop_tokens_threshold": 0} if p["intent"] else {})))
             keys.append(kind)
     if p["intent"] in (None, "compare") and not b and len(nq.split()) >= 2 and p["rule"] not in ("exact", "parent"):
@@ -510,6 +512,9 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             keys.append("use_case_sem")
     got = dict(zip(keys, msearch(searches)))
     uc_sem = got.pop("use_case_sem", [])
+    if short:
+        for kind in TOPIC_TYPES:
+            got[kind] = sorted(got.get(kind, []), key=lambda d: -match_tier(norm(d["title"]), nq))[:2]
     if not anchor and p["intent"] and p.get("entity"):   # keep the candidates' ranking: 'news cr' -> Crayon News first
         rank = {pid: i for i, pid in enumerate(p["scope"])}
         scoped = sorted(got.get(p["intent"], []), key=lambda d: min(
@@ -576,9 +581,9 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         prods = ([anchor] + [h for h in hits if h["id"] != anchor["id"]])[:3]
         if p.get("e2"):                             # 2nd side unmatched/ambiguous: offer its candidates
             seen = {h["id"] for h in prods}
-            prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen]
+            prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen][:5]
     else:
-        prods = hits if p["rule"] == "ambiguous" else hits[:5]
+        prods = hits[:5]
     uc_ids = {d["id"] for d in uc_prods}
     lead = prods[:1] if anchor and match_tier(norm(anchor["title"]), nq) >= 2 else []   # 'lead management
     # automation' -> the product named that way still comes first; a loose match ('sales and marketing ali') does not
