@@ -61,6 +61,13 @@ def use_case_search(nq: str, semantic: bool = SEMANTIC_USE_CASES) -> dict:
                 drop_tokens_threshold=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=20)
 
 
+def is_use_case_name(nq: str) -> bool:
+    """The whole query is a use-case name ('lead management automation for agencies')."""
+    hits = msearch([dict(q=nq, query_by="title", filter_by="type:=use_case", prefix=False, num_typos=0,
+                         drop_tokens_threshold=0, per_page=10)])[0]
+    return any(norm(d["title"]) == nq for d in hits)
+
+
 def msearch(searches: list[dict]) -> list[list[dict]]:
     if not searches:
         return []
@@ -364,7 +371,7 @@ def interpret(nq: str) -> dict:
 
     # Last resort: 'algolia xqyz landingi' / 'landingi xqzw' -> find the product names among unmatched words.
     ext_toks = [t for t in rest if t not in NON_ENTITY_WORDS]
-    if 2 <= len(ext_toks) <= MAX_EXTRACT_TOKENS:
+    if 2 <= len(ext_toks) <= MAX_EXTRACT_TOKENS and not is_use_case_name(nq):   # a use case: not product mentions
         mentions = extract_products(ext_toks)
         if len(mentions) == 2:
             c = evaluate([(3, mentions[0], mentions[1], "bare")])
@@ -548,7 +555,9 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             if not own:                             # no page of its own: 'Demandbase One' -> Demandbase News
                 own = [d for d in vendor if _vendor_of(d, kind, norm(prod["product_names"][0]))][:1]
             got[kind] = _dedupe(got.get(kind, []) + own)   # two candidates may share a vendor page
-    if focus and (anchor or p["intent"] != "use_cases"):   # one link per name, to the product page's use-case section
+    if not anchor and p["intent"] != "use_cases":   # a product's own use cases: only for a confident product
+        got.pop("use_cases", None)
+    elif focus and (anchor or p["intent"] != "use_cases"):   # one link per name, to the product page's use-case section
         shown = USE_CASES_SHOWN if p["intent"] == "use_cases" else USE_CASES_PREVIEW if anchor else USE_CASES_AMBIGUOUS
         got["use_cases"] = [{"id": f"{d['id']}-{k}", "path": d["path"], "type": "use_case",
                              "title": f"{d['product_names'][0]}: {name}" if len(focus) > 1 else name}
@@ -562,18 +571,14 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             seen.add(norm(d["title"]))
             uc.append(d)
     got["use_case"] = uc
+    if uc:                                          # use cases matching the query win over a product's own
+        got.pop("use_cases", None)
     sem_titles = {norm(d["title"]) for d in sem}
-    uc_lead = bool(uc) and match_tier(norm(uc[0]["title"]), nq) >= 2   # the query is (the start of) a use case
-    uc_prods = []
-    if uc_lead:                                     # ... its most popular products lead, linked to their use cases
-        ids = uc[0]["product_ids"]
-        by_id = {d["product_ids"][0]: d for d in msearch([dict(
-            q="*", filter_by=f"type:=product && product_ids:[{','.join(map(str, ids))}]", per_page=len(ids))])[0]}
-        uc_prods = [dict(by_id[i], path=f"{by_id[i]['path']}#use-cases") for i in ids if i in by_id]
+    if any(norm(d["title"]) == nq for d in uc):     # the query is a use-case name
         if not anchor and p["intent"] == "compare":    # 'customer engagement and retention': not 2 products
             got.pop("compare", None)
             p = {**p, "intent": None}
-        if not anchor:                              # these products lead, not the candidates: drop the candidates' pages
+        if not anchor:                              # the use case is the answer: drop the candidates' pages
             focus = _drop_focus_pages(got, focus, p["intent"])
     alias_exact, alias_inner, alias_partial = topic_alias_hits(nq)
     if not anchor:                                  # 'abm xyz': nothing else matched, the abbreviation leads
@@ -610,24 +615,17 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen][:5]
     else:
         prods = hits[:5]
-    uc_ids = {d["id"] for d in uc_prods}
-    lead = prods[:1] if anchor and match_tier(norm(anchor["title"]), nq) >= 2 else []   # 'lead management
-    # automation' -> the product named that way still comes first; a loose match ('sales and marketing ali') does not
-    prods = lead + [d for d in uc_prods if d["id"] not in {x["id"] for x in lead}] + \
-        [h for h in prods[len(lead):] if h["id"] not in uc_ids]
     sections = {"products": prods, **got}
 
     order = ["products", "category", *PRODUCT_PAGE_TYPES, "compare", "industry", "use_case"]
     if p["intent"]:
         order.remove(p["intent"])
         order.insert(0, p["intent"])
-    if uc_lead:                                     # the use case leads, then the products that have it
-        order.remove("use_case")
-        order.insert(0, "use_case")
     for kind in TOPIC_TYPES:                        # an exact category/industry name goes first
         if any(norm(c["title"]) == nq or c["id"] in alias_ids for c in got.get(kind, [])):
             order.remove(kind)
             order.insert(0, kind)
+    category_exact = next((c["title"] for c in got.get("category", []) if norm(c["title"]) == nq), None)
 
     return {
         "query": q,
@@ -635,6 +633,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         "intent": p["intent"],
         "anchor": anchor["title"] if anchor else None,
         "anchor2": b["title"] if b else None,
+        "category_exact": category_exact,          # a category named exactly as the query
         "use_cases_semantic": any(norm(d["title"]) in sem_titles for d in uc),   # some use cases matched by meaning, not words
         "sections": [
             {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]]}

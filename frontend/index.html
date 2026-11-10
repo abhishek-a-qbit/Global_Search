@@ -94,6 +94,7 @@ function render(data) {
   parts.push(data.anchor ? `anchor: <b>${esc(data.anchor)}</b> (${data.rule})` : `no confident product (${data.rule})`);
   if (data.anchor2) parts.push(`vs <b>${esc(data.anchor2)}</b>`);
   if (data.intent) parts.push(`intent: <b>${data.intent}</b>`);
+  if (data.category_exact) parts.push(`category: <b>${esc(data.category_exact)}</b> (exact)`);
   if (data.use_cases_semantic) parts.push(`use cases: <b>keyword + semantic</b>`);
   parts.push(`${data.took_ms} ms`);
   $meta.innerHTML = parts.join(" · ");
