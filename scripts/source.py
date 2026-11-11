@@ -183,7 +183,7 @@ def build_documents(lines: list) -> list[dict]:
             a, b = line.product_ids
             partners.setdefault(a, []).append(b)
             partners.setdefault(b, []).append(a)
-    main = {p.id: p.cat.perma if p.cat else None for p in products}
+    main = {p.id: D.category_slug_candidates(p.category)[0] if p.category else None for p in products}
     # Pages inherit their product's popularity, so "popular news" / "top comparisons" mean something;
     # comparisons count only same-category ones ('6sense vs Demandbase One' over '6sense vs Sendoso')
     product_docs = {p.id: D.product_doc(p.id, p.name, _path(p.url), 1 + len(partners.get(p.id, [])),

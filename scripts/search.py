@@ -2,11 +2,11 @@
 import contextvars
 import functools
 import itertools
-import json
 import re
 
 from config import ALIAS, BASE, SEMANTIC_MAX_DISTANCE, SEMANTIC_USE_CASES, make_client
 from scripts.Textutil import norm
+from scripts.documents import category_slug_candidates
 
 MIN_CHARS = 2
 MAX_SPLIT_TOKENS = 6
@@ -424,7 +424,7 @@ def _dedupe(docs):
 
 def _same_category_compares(anchor: dict, docs: list[dict]) -> list[dict]:
     """A product's comparisons with products shown in a category (not 'Leandata', none linked),
-    of its own main category if any ('6sense': ABM tools, not Sendoso's marketing automation ones)."""
+    of its own category if any ('6sense': ABM tools, not Sendoso's marketing automation ones)."""
     if not docs:
         return docs
     aid = anchor["product_ids"][0]
@@ -432,8 +432,9 @@ def _same_category_compares(anchor: dict, docs: list[dict]) -> list[dict]:
     ids = ",".join(map(str, {aid, *other.values()}))
     recs, prods = msearch([dict(q="*", filter_by=f"type:={t} && product_ids:[{ids}]", per_page=COMPARE_POOL + 1,
                                 include_fields=f"product_ids,{f}")
-                           for t, f in (("record", "record_json"), ("product", "category_id"))])
-    main = {r["product_ids"][0]: (json.loads(r["record_json"]).get("cat") or {}).get("perma") for r in recs}
+                           for t, f in (("record", "category_link"), ("product", "category_id"))])
+    main = {r["product_ids"][0]: category_slug_candidates(r["category_link"])[0] if r.get("category_link") else None
+            for r in recs}
     shown = {p["product_ids"][0] for p in prods if p.get("category_id")}
     docs = [d for d in docs if other[d["id"]] in shown]
     same = [d for d in docs if main.get(aid) and main.get(other[d["id"]]) == main[aid]]
