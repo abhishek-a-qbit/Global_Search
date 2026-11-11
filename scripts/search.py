@@ -1,6 +1,8 @@
 """Query understanding + grouped retrieval on top of Typesense."""
 import contextvars
 import functools
+import itertools
+import json
 import re
 
 from config import ALIAS, BASE, SEMANTIC_MAX_DISTANCE, SEMANTIC_USE_CASES, make_client
@@ -28,7 +30,10 @@ PRODUCT_PAGE_TYPES = ("news", "customer_story", "alternatives", "use_cases")   #
 VENDOR_PAGE_TYPES = ("news", "customer_story", "alternatives")                # ... also per vendor
 USE_CASES_SHOWN = 10                                                            # names listed per product on '... use cases'
 USE_CASES_PREVIEW = 5                                                           # ... on a plain product search
-USE_CASES_AMBIGUOUS = 3                                                         # ... per candidate, no confident product
+COMPARE_POOL = 249                                                              # a product's comparisons fetched (all but
+#                                                                                 1 product's; + itself = Typesense's 250 max) ...
+COMPARES_SHOWN = 5                                                              # ... and shown, same category first
+USE_CASES_CAP = 6                                                               # any other use-case list (2 products: in total)
 AMBIGUOUS_FOCUS = 2                                                             # candidates whose own pages are shown
 TOPIC_TYPES = ("category", "industry")                             # matched by title
 TOPIC_ALIASES = {        # extra names for categories / industries, keyed by normalized title
@@ -290,26 +295,35 @@ def interpret(nq: str) -> dict:
             cands.append({"group": group, "kind": kind, "anchor": la, "rule": lr, "hits": lh, "e2": rtext,
                           "b": ra if rr in RULE_RANK else None, "b_rule": rr, "e2_hits": rh})
 
+        def partner_search(q, pid):
+            return dict(q=q, query_by="product_names", prefix=True, num_typos=0,
+                        filter_by=f"type:=compare && product_ids:={pid}", per_page=50)
+
         searches = []
         for c in cands:
             c["e2q"] = norm(c["b"]["product_names"][0]) if c["b"] else c["e2"]
             if c["e2q"]:
-                searches.append(dict(q=c["e2q"], query_by="product_names", prefix=True, num_typos=0,
-                                     filter_by=f"type:=compare && product_ids:={c['anchor']['product_ids'][0]}",
-                                     per_page=50))
+                searches.append(partner_search(c["e2q"], c["anchor"]["product_ids"][0]))
+            if c["b"]:                              # ... and the other way round: 'hubspot vs salesforce'
+                searches.append(partner_search(norm(c["anchor"]["product_names"][0]), c["b"]["product_ids"][0]))
         partner_results = iter(msearch(searches))
+        prefix = lambda c: "^" if c["kind"] == "bare" else r"(^| )"
         for c in cands:
             c["pair"], c["partners"] = [], []
             if not c["e2q"]:
                 continue
             aid = c["anchor"]["product_ids"][0]
             bid = c["b"]["product_ids"][0] if c["b"] else None
-            pat = re.compile(("^" if c["kind"] == "bare" else r"(^| )") + re.escape(c["e2q"]))
+            pat = re.compile(prefix(c) + re.escape(c["e2q"]))
             for d in next(partner_results):
                 if bid is not None and bid in d["product_ids"]:
                     c["pair"].append(d)
                 elif pat.search(_other_name(d, aid)):
                     c["partners"].append(d)
+            if c["b"]:
+                pat = re.compile(prefix(c) + re.escape(norm(c["anchor"]["product_names"][0])))
+                c["partners"] = _dedupe(c["partners"] + [d for d in next(partner_results)
+                                                         if aid not in d["product_ids"] and pat.search(_other_name(d, bid))])
         return cands
 
     def extract_products(ext_toks):
@@ -408,6 +422,24 @@ def _dedupe(docs):
     return list({d["id"]: d for d in docs}.values())
 
 
+def _same_category_compares(anchor: dict, docs: list[dict]) -> list[dict]:
+    """A product's comparisons with products shown in a category (not 'Leandata', none linked),
+    of its own main category if any ('6sense': ABM tools, not Sendoso's marketing automation ones)."""
+    if not docs:
+        return docs
+    aid = anchor["product_ids"][0]
+    other = {d["id"]: next((p for p in d["product_ids"] if p != aid), aid) for d in docs}
+    ids = ",".join(map(str, {aid, *other.values()}))
+    recs, prods = msearch([dict(q="*", filter_by=f"type:={t} && product_ids:[{ids}]", per_page=COMPARE_POOL + 1,
+                                include_fields=f"product_ids,{f}")
+                           for t, f in (("record", "record_json"), ("product", "category_id"))])
+    main = {r["product_ids"][0]: (json.loads(r["record_json"]).get("cat") or {}).get("perma") for r in recs}
+    shown = {p["product_ids"][0] for p in prods if p.get("category_id")}
+    docs = [d for d in docs if other[d["id"]] in shown]
+    same = [d for d in docs if main.get(aid) and main.get(other[d["id"]]) == main[aid]]
+    return same or docs
+
+
 def _drop_focus_pages(got: dict, focus: list, intent) -> list:
     """Removes the top candidates' own pages (not the intent's, listed for every candidate); returns no focus."""
     if focus:
@@ -500,12 +532,12 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         aid = anchor["product_ids"][0]
         if not p.get("e2") or not (b or p["pair"] or p["partners"]):   # nothing matched the 2nd side: show anchor's
             searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={aid}",
-                                 sort_by="popularity:desc", per_page=5))
+                                 sort_by="popularity:desc", per_page=COMPARE_POOL))   # same category: below
             keys.append("compare")
         elif b and not p["pair"]:                   # both products known, no page for the pair
             for pid, key in ((aid, "compare_a"), (b["product_ids"][0], "compare_b")):
                 searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={pid}",
-                                     sort_by="popularity:desc", per_page=3))
+                                     sort_by="popularity:desc", per_page=COMPARE_POOL))   # filtered like 'compare'
                 keys.append(key)
     elif p["intent"]:                               # intent, no confident product: candidates' pages, else the most popular
         scope, entity = p.get("scope"), p.get("entity")
@@ -539,6 +571,11 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             searches.append(use_case_search(nq, True))
             keys.append("use_case_sem")
     got = dict(zip(keys, msearch(searches)))
+    if anchor and got.get("compare"):
+        got["compare"] = _same_category_compares(anchor, got["compare"])[:COMPARES_SHOWN]
+    for key, prod in (("compare_a", anchor), ("compare_b", b)):
+        if key in got:
+            got[key] = _same_category_compares(prod, got[key])[:3]
     uc_sem = got.pop("use_case_sem", [])
     if short:
         for kind in TOPIC_TYPES:
@@ -557,12 +594,17 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             got[kind] = _dedupe(got.get(kind, []) + own)   # two candidates may share a vendor page
     if not anchor and p["intent"] != "use_cases":   # a product's own use cases: only for a confident product
         got.pop("use_cases", None)
-    elif focus and (anchor or p["intent"] != "use_cases"):   # one link per name, to the product page's use-case section
-        shown = USE_CASES_SHOWN if p["intent"] == "use_cases" else USE_CASES_PREVIEW if anchor else USE_CASES_AMBIGUOUS
-        got["use_cases"] = [{"id": f"{d['id']}-{k}", "path": d["path"], "type": "use_case",
-                             "title": f"{d['product_names'][0]}: {name}" if len(focus) > 1 else name}
-                            for d in got.get("use_cases", [])
-                            for k, name in enumerate(d.get("use_case_names", [])[:shown])]
+    elif anchor:                                    # one link per name, to the product page's use-case section
+        shown = USE_CASES_SHOWN if p["intent"] == "use_cases" else USE_CASES_PREVIEW
+        lists = [[{"id": f"{d['id']}-{k}", "path": d["path"], "type": "use_case", "title": name}
+                  for k, name in enumerate(d.get("use_case_names", [])[:shown])] for d in got.get("use_cases", [])]
+        items = [x for row in itertools.zip_longest(*lists) for x in row if x]   # 2 products: taking turns
+        if len(lists) > 1:                          # ... one per name, 6 in total
+            first = {}
+            for x in items:
+                first.setdefault(norm(x["title"]), x)
+            items = list(first.values())[:USE_CASES_CAP]
+        got["use_cases"] = items
     kw = sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))[:5]   # names starting with the query first
     sem = uc_sem[:5]                                # closest meaning first, as returned
     seen, uc = set(), []
@@ -570,6 +612,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         if norm(d["title"]) not in seen:
             seen.add(norm(d["title"]))
             uc.append(d)
+    uc = uc[:USE_CASES_CAP]
     got["use_case"] = uc
     if uc:                                          # use cases matching the query win over a product's own
         got.pop("use_cases", None)
@@ -604,7 +647,8 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         if p["pair"] or not b:
             got["compare"] = (p["pair"] + p["partners"])[:5]
         else:
-            got["compare"] = _dedupe(got.pop("compare_a") + got.pop("compare_b"))
+            got["compare"] = _dedupe(p["partners"] + got.pop("compare_a") + got.pop("compare_b"))[:6]   # 'salesforce
+            # vs hubspot': no HubSpot page, but HubSpot CRM vs Salesforce CRM first
 
     if b:
         prods = [anchor, b]

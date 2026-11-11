@@ -2,8 +2,9 @@
 - product records (prod.json entries) and their use-case lists (product_usecases.json entries),
   stored as hidden 'record' documents whether or not the product has a page;
 - website pages, given by URL like a sitemap entry (product pages make products searchable).
-Every change also rewrites what is derived from it: popularity (1 + comparisons, inherited by pages
-and comparisons), titles, each use case's top products, vendor page popularity, product categories."""
+Every change also rewrites what is derived from it: popularity (1 + comparisons, inherited by pages;
+comparisons: 1 + same-category comparisons of each side), titles, each use case's top products,
+vendor page popularity, product categories."""
 import json
 import re
 import threading
@@ -146,18 +147,33 @@ def _slug_name(path: str) -> str:
     return pretty(re.sub(r"-x-\d+$", "", path.rstrip("/").rsplit("/", 1)[-1]))
 
 
-def _product_doc(pid: int, path: str, popularity: int, rec: dict | None) -> dict:
+def _product_doc(pid: int, path: str, popularity: int, rec: dict | None, compare_popularity: int | None = None) -> dict:
     """Name and category from the record; without one, the name comes from the URL."""
     return D.product_doc(pid, rec["title"] if rec else _slug_name(path), path, popularity,
-                         _category_page(rec.get("category_link")) if rec else None)
+                         _category_page(rec.get("category_link")) if rec else None, compare_popularity)
+
+
+def _main_category(rec: dict | None) -> str | None:
+    return (json.loads(rec["record_json"]).get("cat") or {}).get("perma") if rec else None
+
+
+def _popularities(pids) -> dict[int, tuple[int, int]]:
+    """pid -> (popularity: 1 + comparisons, compare_popularity: 1 + same-category comparisons)."""
+    partners = {pid: [i for c in _find(f"type:=compare && product_ids:={pid}", include="product_ids")
+                      for i in c["product_ids"] if i != pid] for pid in set(pids)}
+    main = {pid: _main_category(r) for pid, r in _records({*partners, *(i for v in partners.values() for i in v)}).items()}
+    return {pid: (1 + len(ps), D.same_category_popularity(pid, ps, main)) for pid, ps in partners.items()}
 
 
 def _update_popularity(pids) -> None:
-    """Popularity = 1 + number of comparisons; on change, rewrite everything that inherits it."""
+    """Popularity and compare_popularity; on change, rewrite everything that inherits them."""
     prods = list(_products(pids).values())
-    counts = _msearch([dict(q="*", filter_by=f"type:=compare && product_ids:={p['product_ids'][0]}", per_page=0)
-                       for p in prods])
-    changed = [dict(p, popularity=1 + r["found"]) for p, r in zip(prods, counts) if 1 + r["found"] != p["popularity"]]
+    pops = _popularities(p["product_ids"][0] for p in prods)
+    changed = []
+    for p in prods:
+        pop, cpop = pops[p["product_ids"][0]]
+        if (pop, cpop) != (p["popularity"], p.get("compare_popularity")):
+            changed.append(dict(p, popularity=pop, compare_popularity=cpop))
     _write(changed)
     _propagate(changed)
 
@@ -192,7 +208,7 @@ def _refresh_compares(pids) -> None:
     for c in comps.values():
         pair = c["product_ids"]
         names = [prods[i]["title"] if i in prods else c["product_names"][k] for k, i in enumerate(pair)]
-        new = D.compare_doc(c["path"], tuple(pair), names, sum(prods[i]["popularity"] if i in prods else 1 for i in pair))
+        new = D.compare_doc(c["path"], tuple(pair), names, sum(D.compare_weight(prods.get(i)) for i in pair))
         if new != c:
             out.append(new)
     _write(out)
@@ -253,13 +269,15 @@ def _relink_category(page: dict, category_id: str | None = None) -> None:
     """Products whose category page was added / renamed / removed: refresh their category link."""
     if category_id:                        # removed: products pointing at it lose the link
         prods = _find(f"type:=product && category_id:=`{category_id}`")
-        _write([D.product_doc(p["product_ids"][0], p["title"], p["path"], p["popularity"]) for p in prods])
+        _write([D.product_doc(p["product_ids"][0], p["title"], p["path"], p["popularity"],
+                              compare_popularity=p.get("compare_popularity")) for p in prods])
     else:                                  # added / renamed: products whose record names this category
         slug = page["path"].rsplit("/", 1)[-1]
         links = {slug, slug.removesuffix("s"), *(k for k, v in D.CATEGORY_SLUG_FIXES.items() if v == slug)}
         recs = _find(f"type:=record && category_link:[{_ids(links)}]", include="product_ids")
         prods = _products(r["product_ids"][0] for r in recs).values()
-        _write([D.product_doc(p["product_ids"][0], p["title"], p["path"], p["popularity"], page) for p in prods])
+        _write([D.product_doc(p["product_ids"][0], p["title"], p["path"], p["popularity"], page,
+                              p.get("compare_popularity")) for p in prods])
     search.topic_aliases.cache_clear()     # abbreviations ('abm') are built from titles
 
 
@@ -290,13 +308,17 @@ def _save_record(pid: int, soft: str, cat: dict | None, cats: list[dict],
                  category_link: str | None, use_cases: list[dict]) -> dict:
     """Write the record and, if the product has a page, the product document (and whatever the
     new name / category changes). Also lets category pages pick up the record's names."""
+    old_main = _main_category(_get(f"record-{pid}"))
     rec = D.record_doc(pid, soft, cat, cats, category_link, use_cases)
     _write([rec])
     if prod := _get(f"product-{pid}"):
-        doc = _product_doc(pid, prod["path"], prod["popularity"], rec)
+        doc = _product_doc(pid, prod["path"], prod["popularity"], rec, prod.get("compare_popularity"))
         _write([doc])
         if doc["title"] != prod["title"]:
             _propagate([doc], old_names=[prod["title"]])
+    if _main_category(rec) != old_main:             # same-category comparisons change on both sides
+        _update_popularity({pid, *(i for c in _find(f"type:=compare && product_ids:={pid}", include="product_ids")
+                                   for i in c["product_ids"])})
     _name_categories(([cat] if cat else []) + cats)
     return rec
 
@@ -304,8 +326,8 @@ def _save_record(pid: int, soft: str, cat: dict | None, cats: list[dict],
 def _publish_product(pid: int, path: str) -> None:
     """Create or move the product's page; the product becomes searchable."""
     old = _get(f"product-{pid}")
-    pop = old["popularity"] if old else 1 + _count(f"type:=compare && product_ids:={pid}")
-    doc = _product_doc(pid, path, pop, _get(f"record-{pid}"))
+    pop, cpop = (old["popularity"], old.get("compare_popularity")) if old else _popularities([pid])[pid]
+    doc = _product_doc(pid, path, pop, _get(f"record-{pid}"), cpop)
     _write([doc])
     orphans = [p for kind, slug in D.PAGE_KINDS.items()                # its pages added before it
                if (p := _get(D.path_id(kind, f"{path}/{slug}"))) and not p["product_ids"]]
@@ -472,7 +494,7 @@ def add_page(kind: str, url: str, title: str | None = None,
             names = [prods[i]["title"] if i in prods else f"Product {i}" for i in product_ids]
             doc = D.compare_doc(path, tuple(product_ids), names,
                                 popularity if popularity is not None
-                                else sum(prods[i]["popularity"] if i in prods else 1 for i in product_ids))
+                                else sum(D.compare_weight(prods.get(i)) for i in product_ids))
         elif kind in D.PAGE_KINDS:
             if len(product_ids) > 1:
                 raise ValueError(f"A {kind} page links to at most one product")

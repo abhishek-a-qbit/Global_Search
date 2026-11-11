@@ -46,7 +46,8 @@ def category_slug_candidates(slug: str) -> list[str]:
     return [slug, f"{slug}s"]                          # 'payment-gateway' -> '/categories/payment-gateways'
 
 
-def product_doc(product_id: int, name: str, path: str, popularity: int, category: dict | None = None) -> dict:
+def product_doc(product_id: int, name: str, path: str, popularity: int, category: dict | None = None,
+                compare_popularity: int | None = None) -> dict:
     doc = {
         "id": f"product-{product_id}",
         "type": "product",
@@ -56,10 +57,24 @@ def product_doc(product_id: int, name: str, path: str, popularity: int, category
         "product_ids": [product_id],
         "name_len": len(name),
         "popularity": popularity,
+        "compare_popularity": popularity if compare_popularity is None else compare_popularity,   # stored only
     }
     if category:                                       # the category page document
         doc.update(category_id=category["id"], category_title=category["title"], category_path=category["path"])
     return doc
+
+
+def compare_weight(product: dict | None) -> int:
+    """A product's share of its comparisons' popularity: 1 + its comparisons with products of its own
+    main category (Sendoso: its ABM ones, not the marketing automation ones); no category: all."""
+    return product.get("compare_popularity", product["popularity"]) if product else 1
+
+
+def same_category_popularity(pid: int, partners: list[int], main: dict[int, str | None]) -> int:
+    """compare_popularity: 1 + comparisons with a partner of the same main category (cat)."""
+    if not main.get(pid):
+        return 1 + len(partners)
+    return 1 + sum(main.get(o) == main[pid] for o in partners)
 
 
 def page_doc(kind: str, path: str, product: dict | None = None, popularity: int = 1) -> dict:

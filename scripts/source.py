@@ -177,13 +177,17 @@ def build_documents(lines: list) -> list[dict]:
                                   [c.model_dump() for c in p.cats], p.category,
                                   D.unique_use_cases(u.model_dump() for u in p.use_cases)) for p in products}
 
-    comparison_counts = {}
+    partners = {}
     for line in lines:
         if line.type == "compare":
-            for pid in line.product_ids:
-                comparison_counts[pid] = comparison_counts.get(pid, 0) + 1
-    # Pages inherit their product's popularity, so "popular news" / "top comparisons" mean something
-    product_docs = {p.id: D.product_doc(p.id, p.name, _path(p.url), 1 + comparison_counts.get(p.id, 0))
+            a, b = line.product_ids
+            partners.setdefault(a, []).append(b)
+            partners.setdefault(b, []).append(a)
+    main = {p.id: p.cat.perma if p.cat else None for p in products}
+    # Pages inherit their product's popularity, so "popular news" / "top comparisons" mean something;
+    # comparisons count only same-category ones ('6sense vs Demandbase One' over '6sense vs Sendoso')
+    product_docs = {p.id: D.product_doc(p.id, p.name, _path(p.url), 1 + len(partners.get(p.id, [])),
+                                        compare_popularity=D.same_category_popularity(p.id, partners.get(p.id, []), main))
                     for p in products if p.url}
     names_by_first_word = {}
     for p in product_docs.values():
@@ -212,7 +216,7 @@ def build_documents(lines: list) -> list[dict]:
                 name = product_docs[pid]["title"] if pid in product_docs else None
                 names.append(name or (pretty(slug_names[index]) if len(slug_names) == 2 else f"Product {pid}"))
             documents.append(_override(D.compare_doc(path, tuple(line.product_ids), names, sum(
-                product_docs[pid]["popularity"] if pid in product_docs else 1 for pid in line.product_ids)), line))
+                D.compare_weight(product_docs.get(pid)) for pid in line.product_ids)), line))
 
     add_product_categories(documents, records)
     return documents + build_use_case_documents(documents, records) + list(records.values())
