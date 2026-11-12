@@ -222,8 +222,8 @@ def pick_anchor(text: str, hits: list[dict]):
         for h, n in sorted(zip(hits, names), key=lambda x: len(x[1])):
             if n in group and all(g.split()[:len(n.split())] == n.split() for g in group):
                 return h, "parent"
-        qw = nq.split()                            # ... or every match is '<query> ...' ('salesforce'): its top product
-        if starts and all(n.split()[:len(qw)] == qw for n in names if match_tier(n, nq)):
+        qw = nq.split()                            # ... or every prefix match is '<query> ...' ('salesforce'): its top product
+        if starts and all(n.split()[:len(qw)] == qw for n in names if match_tier(n, nq) >= 2):
             return hits[0], "parent"
     if len(nq) >= 3 and match_tier(names[0], nq) != 1:   # 3. clear popularity winner (not a later-word match like 'crm' -> 'C3 CRM')
         p0 = hits[0]["popularity"]

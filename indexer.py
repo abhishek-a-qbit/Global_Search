@@ -1,9 +1,11 @@
 """Build the Typesense collection from the configured Cuspera sitemaps (initial build).
 
-The sitemaps and prod.json / product_usecases.json / product_categories.json are turned into
-source-file lines (scripts/source.py) and indexed like a source file. After that, changes go through
-the catalog API (app/catalog_api.py) or a source-file sync (POST /api/sync): a rebuild replaces the
-whole index, so it refuses to run while the search alias exists unless --force is given."""
+The sitemaps and product_usecases.json / product_categories.json are turned into
+source-file lines (scripts/source.py) and indexed like a source file. Product names come
+from the page slugs ('/products/meritto-x-19367' -> 'Meritto'), so renamed products stay
+findable. After that, changes go through the catalog API (app/catalog_api.py) or a
+source-file sync (POST /api/sync): a rebuild replaces the whole index, so it refuses to
+run while the search alias exists unless --force is given."""
 import json
 import re
 import sys
@@ -18,7 +20,6 @@ from scripts.documents import unique_use_cases
 from scripts.source import alias_exists, build_documents, client, full_build, parse
 from scripts.Textutil import pretty
 
-PRODUCTS_FILE = Path(__file__).parent / "prod.json"   # {"CFProdCode-<id>": {"tool_id", "soft", "cat"?, "cats"?}}
 USE_CASES_FILE = Path(__file__).parent / "product_usecases.json"   # {"CFProdCode-<product id>": [{"id", "name"}, ...]}
 CATEGORIES_FILE = Path(__file__).parent / "product_categories.json"   # {"CFProdCode-<product id>": "<category slug>"}
 SESSION = requests.Session()                         # sitemap downloads only
@@ -55,18 +56,14 @@ def source_lines() -> list[dict]:
         if match := re.search(r"-x-(\d+)$", path.rstrip("/").rsplit("/", 1)[-1]):
             page_paths[int(match.group(1))] = path
 
-    products, use_cases, links = load(PRODUCTS_FILE), load(USE_CASES_FILE), load(CATEGORIES_FILE)
+    use_cases, links = load(USE_CASES_FILE), load(CATEGORIES_FILE)
     lines = []
-    for key, r in products.items():
-        pid = int(key.rsplit("-", 1)[-1])
-        path = page_paths.pop(pid, None)
-        lines.append({"type": "product", "id": pid, "name": r["soft"], "url": BASE + path if path else None,
+    for pid, path in page_paths.items():               # every product page: named by its url slug
+        slug = re.sub(r"-x-\d+$", "", path.rstrip("/").rsplit("/", 1)[-1])
+        key = f"CFProdCode-{pid}"
+        lines.append({"type": "product", "id": pid, "name": pretty(slug), "url": BASE + path,
                       **({"category": links[key]} if links.get(key) else {}),
-                      **({k: r[k] for k in ("cat", "cats") if r.get(k)}),
                       "use_cases": unique_use_cases(use_cases.get(key, []))})
-    for pid, path in page_paths.items():               # product pages without a prod.json record: named by url
-        lines.append({"type": "product", "id": pid, "url": BASE + path,
-                      "name": pretty(re.sub(r"-x-\d+$", "", path.rstrip("/").rsplit("/", 1)[-1]))})
 
     for sitemap_kind, page_type in (("news", "news"), ("customer-story", "customer_story"),
                                     ("alternatives", "alternatives"), ("categories", "category"),
