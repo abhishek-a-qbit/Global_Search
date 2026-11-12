@@ -34,7 +34,7 @@ COMPARE_POOL = 249                                                              
 #                                                                                 1 product's; + itself = Typesense's 250 max) ...
 COMPARES_SHOWN = 5                                                              # ... and shown, same category first
 USE_CASES_CAP = 6                                                               # any other use-case list (2 products: in total)
-AMBIGUOUS_FOCUS = 2                                                             # candidates whose own pages are shown
+AMBIGUOUS_FOCUS = 5                                                             # candidates whose own pages are shown
 TOPIC_TYPES = ("category", "industry")                             # matched by title
 TOPIC_ALIASES = {        # extra names for categories / industries, keyed by normalized title
     "crm": ["customer relationship management"],
@@ -551,8 +551,15 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             searches.append(dict(q=entity, query_by="title", filter_by=f"type:={p['intent']}", prefix=True,
                                  num_typos=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=10))
             keys.append("intent_titles")
-    if not p["intent"] or (p["intent"] == "compare" and not anchor):
-        topic_q = nq
+    amb_ids = []
+    if not anchor and p["rule"] == "ambiguous" and "compare" not in keys:
+        amb_ids = [h["product_ids"][0] for h in hits[:5] if h.get("product_ids")]   # the candidates' comparisons
+        for pid in amb_ids:                        # one search each: mixed below, not one product dominating
+            searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={pid}",
+                                 sort_by="popularity:desc", per_page=10))
+            keys.append(f"compare_{pid}")
+    if not anchor and (not p["intent"] or p["intent"] == "compare"):
+        topic_q = nq                                     # confident product: its own category is enough
     elif not anchor and p["intent"] not in TOPIC_TYPES:   # 'usecase crm': the entity's categories / industries too
         topic_q = p.get("entity")
     else:
@@ -577,6 +584,14 @@ def _run(q: str, semantic: bool | None = None) -> dict:
     for key, prod in (("compare_a", anchor), ("compare_b", b)):
         if key in got:
             got[key] = _same_category_compares(prod, got[key])[:3]
+    if amb_ids:                                     # ambiguous: one comparison per candidate, taking turns
+        by_pid = {h["product_ids"][0]: h for h in hits[:5]}
+        lists = [_same_category_compares(by_pid[pid], got.pop(f"compare_{pid}", [])) for pid in amb_ids]
+        items = [d for row in itertools.zip_longest(*lists) for d in row if d]
+        first = {}
+        for d in items:
+            first.setdefault(d["id"], d)
+        got["compare"] = list(first.values())[:COMPARES_SHOWN]
     uc_sem = got.pop("use_case_sem", [])
     if short:
         for kind in TOPIC_TYPES:
@@ -592,7 +607,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             own, vendor = got.pop(f"{kind}_{i}", []), got.pop(f"{kind}_vendor_{i}", [])
             if not own:                             # no page of its own: 'Demandbase One' -> Demandbase News
                 own = [d for d in vendor if _vendor_of(d, kind, norm(prod["product_names"][0]))][:1]
-            got[kind] = _dedupe(got.get(kind, []) + own)   # two candidates may share a vendor page
+            got[kind] = _dedupe(got.get(kind, []) + own)[:5]   # two candidates may share a vendor page
     if not anchor and p["intent"] != "use_cases":   # a product's own use cases: only for a confident product
         got.pop("use_cases", None)
     elif anchor:                                    # one link per name, to the product page's use-case section
