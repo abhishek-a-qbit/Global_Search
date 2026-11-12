@@ -154,7 +154,9 @@ def _product_doc(pid: int, path: str, popularity: int, rec: dict | None, compare
 
 
 def _main_category(rec: dict | None) -> str | None:
-    return (json.loads(rec["record_json"]).get("cat") or {}).get("perma") if rec else None
+    """The product's shown category (product_categories.json slug), normalized like the build path."""
+    slug = rec.get("category_link") if rec else None
+    return D.category_slug_candidates(slug)[0] if slug else None
 
 
 def _popularities(pids) -> dict[int, tuple[int, int]]:
