@@ -662,7 +662,9 @@ def _run(q: str, semantic: bool | None = None) -> dict:
     if b:
         prods = [anchor, b]
     elif anchor:
-        prods = ([anchor] + [h for h in hits if h["id"] != anchor["id"]])[:3]
+        # exact / parent: the anchor is the answer. dominant: also its closest alternatives.
+        # unmatched 2nd side of a comparison: its candidates too
+        prods = ([anchor] + [h for h in hits if h["id"] != anchor["id"]])[:1 if p["rule"] in ("exact", "parent") else 3]
         if p.get("e2"):                             # 2nd side unmatched/ambiguous: offer its candidates
             seen = {h["id"] for h in prods}
             prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen][:5]
