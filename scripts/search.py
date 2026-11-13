@@ -182,17 +182,10 @@ def match_tier(name: str, nq: str) -> int:
 
 
 def rank_products(nq: str, hits: list[dict]) -> list[dict]:
-    """Match tier, then popularity; within a tier one product per family (first word) comes
-    first, so 'sales' lists Salesforce, Salesmate, ... before a second Salesforce product."""
+    """Match tier, then popularity, then shorter name: pure popularity order within a tier."""
     hits = sorted(_dedupe(hits), key=lambda h: (-match_tier(norm(h["product_names"][0]), nq),
                                                 -h["popularity"], h["name_len"]))
-    seen, keyed = {}, []
-    for rank, h in enumerate(hits):
-        name = norm(h["product_names"][0])
-        family = (match_tier(name, nq), name.split()[0] if name else "")
-        keyed.append((-family[0], seen.get(family, 0), rank, h))
-        seen[family] = seen.get(family, 0) + 1
-    return [h for *_, h in sorted(keyed, key=lambda k: k[:3])]
+    return hits
 
 
 def resolve_products(texts) -> dict[str, list[dict]]:
