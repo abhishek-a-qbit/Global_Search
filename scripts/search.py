@@ -215,9 +215,11 @@ def pick_anchor(text: str, hits: list[dict]):
         for h, n in sorted(zip(hits, names), key=lambda x: len(x[1])):
             if n in group and all(g.split()[:len(n.split())] == n.split() for g in group):
                 return h, "parent"
-        qw = nq.split()                            # ... or every prefix match is '<query> ...' ('salesforce'): its top product
+        qw = nq.split()                            # ... or every prefix match is '<query> ...' ('salesforce'): its top product,
         if starts and all(n.split()[:len(qw)] == qw for n in names if match_tier(n, nq) >= 2):
-            return hits[0], "parent"
+            tops = [h for h, n in zip(hits, names) if n.startswith(nq)]   # a brand with several products ('adobe')
+            if tops[0]["popularity"] >= 3 * max((h["popularity"] for h in tops[1:]), default=1):   # is ambiguous unless one dominates
+                return hits[0], "parent"
     if len(nq) >= 3 and match_tier(names[0], nq) != 1:   # 3. clear popularity winner (not a later-word match like 'crm' -> 'C3 CRM')
         p0 = hits[0]["popularity"]
         p1 = max((h["popularity"] for h in hits[1:]), default=0)
@@ -285,8 +287,10 @@ def interpret(nq: str) -> dict:
                 continue
             if ra and ra["id"] == la["id"]:
                 ra, rr = None, "none"
+            if rr == "ambiguous" and rh:             # 'hubspot vs salesforce': compare against its top product
+                ra = rh[0]                           # but keep showing the ambiguous side's candidates
             cands.append({"group": group, "kind": kind, "anchor": la, "rule": lr, "hits": lh, "e2": rtext,
-                          "b": ra if rr in RULE_RANK else None, "b_rule": rr, "e2_hits": rh})
+                          "b": ra if rr in RULE_RANK or ra else None, "b_rule": rr, "e2_hits": rh})
 
         def partner_search(q, pid):
             return dict(q=q, query_by="product_names", prefix=True, num_typos=0,
@@ -294,7 +298,7 @@ def interpret(nq: str) -> dict:
 
         searches = []
         for c in cands:
-            c["e2q"] = norm(c["b"]["product_names"][0]) if c["b"] else c["e2"]
+            c["e2q"] = norm(c["b"]["product_names"][0]) if c["b"] and c["b_rule"] in RULE_RANK else c["e2"]
             if c["e2q"]:
                 searches.append(partner_search(c["e2q"], c["anchor"]["product_ids"][0]))
             if c["b"]:                              # ... and the other way round: 'hubspot vs salesforce'
