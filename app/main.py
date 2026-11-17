@@ -1,6 +1,8 @@
 import time
 from pathlib import Path
+from typing import Literal
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -38,7 +40,20 @@ def api_product(pid: int):
         return search.product_panels(pid)
     except KeyError:
         raise HTTPException(404, f"Product not found: {pid}")
-    except (TypesenseClientError, RuntimeError) as e:
+    except (TypesenseClientError, RuntimeError, httpx.HTTPError) as e:   # httpx: timeouts, connection errors
+        raise HTTPException(503, f"Typesense error: {e}")
+
+
+@app.get("/api/more")
+def api_more(kind: Literal["use_case", "compare"],
+             q: str = Query("", max_length=200, description="use_case: the query"),
+             page: int = Query(2, ge=2, le=1000, description="use_case: the page"),
+             pids: str = Query("", max_length=1000, pattern=r"^(\d+(,\d+){0,49})?$",
+                               description="compare: the products (comma-separated, in list order)")):
+    """The next page of an ambiguous search's use cases or comparisons (the board loads it on scroll)."""
+    try:
+        return search.more(kind, q, page, [int(x) for x in pids.split(",") if x])
+    except (TypesenseClientError, RuntimeError, httpx.HTTPError) as e:
         raise HTTPException(503, f"Typesense error: {e}")
 
 
@@ -66,7 +81,7 @@ def api_search(q: str = Query("", max_length=200),
     t0 = time.perf_counter()
     try:
         result = search.run(q, semantic, collection)
-    except (TypesenseClientError, RuntimeError) as e:
+    except (TypesenseClientError, RuntimeError, httpx.HTTPError) as e:   # httpx: timeouts, connection errors
         if collection and collection not in {c["name"] for c in api_collections()["collections"]}:
             raise HTTPException(404, f"Collection not found: {collection}")
         if _index_missing():

@@ -14,6 +14,7 @@ MAX_EXTRACT_TOKENS = 8
 MAX_SPAN_TOKENS = 4
 MAX_CANDIDATES = 10000      # words a prefix expands to; Typesense's default 4 drops rarer ones ('soc' -> no 'Socialflow')
 client = make_client(timeout_seconds=2)             # search-as-you-type: fail fast
+bulk_client = make_client(timeout_seconds=30)       # ... except the full lists of an ambiguous query (many pages)
 COLLECTION = contextvars.ContextVar("collection", default=ALIAS)   # per request: the alias, or a build to compare
 
 SECTION_LABELS = {
@@ -35,6 +36,8 @@ COMPARE_POOL = 249                                                              
 #                                                                                 1 product's; + itself = Typesense's 250 max) ...
 COMPARES_SHOWN = 5                                                              # ... and shown, same category first
 USE_CASES_CAP = 6                                                               # any other use-case list (2 products: in total)
+PAGE_SIZE = 50                                                                  # ambiguous lists: items per page (more on scroll)
+COMPARE_CHUNK = 5                                                               # ... comparisons: of this many products per page
 AMBIGUOUS_FOCUS = 5                                                             # candidates whose own pages are shown
 TOPIC_TYPES = ("category", "industry")                             # matched by title
 TOPIC_ALIASES = {        # extra names for categories / industries, keyed by normalized title
@@ -64,7 +67,7 @@ def use_case_search(nq: str, semantic: bool = SEMANTIC_USE_CASES) -> dict:
         return dict(q=nq, query_by="embedding", filter_by="type:=use_case", per_page=20,
                     vector_query=f"embedding:([], distance_threshold: {SEMANTIC_MAX_DISTANCE})")
     return dict(q=nq, query_by="title", filter_by="type:=use_case", prefix=True, num_typos=0,
-                drop_tokens_threshold=0, max_candidates=MAX_CANDIDATES,
+                drop_tokens_threshold=0, max_candidates=MAX_CANDIDATES, prioritize_token_position=True,
                 sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=20)
 
 
@@ -75,10 +78,10 @@ def is_use_case_name(nq: str) -> bool:
     return any(norm(d["title"]) == nq for d in hits)
 
 
-def _perform(searches: list[dict]) -> list[dict]:
+def _perform(searches: list[dict], cl=client) -> list[dict]:
     if not searches:
         return []
-    response = client.multi_search.perform({"searches": [{"collection": COLLECTION.get(), "exclude_fields": HEAVY_FIELDS, **s}
+    response = cl.multi_search.perform({"searches": [{"collection": COLLECTION.get(), "exclude_fields": HEAVY_FIELDS, **s}
                                                          for s in searches]})   # long lists: fetched only when shown
     for res in response["results"]:
         if "error" in res:
@@ -86,17 +89,17 @@ def _perform(searches: list[dict]) -> list[dict]:
     return response["results"]
 
 
-def msearch(searches: list[dict]) -> list[list[dict]]:
-    return [[h["document"] for h in res["hits"]] for res in _perform(searches)]
+def msearch(searches: list[dict], cl=client) -> list[list[dict]]:
+    return [[h["document"] for h in res["hits"]] for res in _perform(searches, cl)]
 
 
 def msearch_all(search: dict) -> list[dict]:
     """Every hit of one search: page 1, then all other pages in one round trip."""
-    first = _perform([{**search, "per_page": 250, "page": 1}])[0]
+    first = _perform([{**search, "per_page": 250, "page": 1}], bulk_client)[0]
     docs = [h["document"] for h in first["hits"]]
     pages = [{**search, "per_page": 250, "page": i} for i in range(2, -(-first["found"] // 250) + 1)]
     for i in range(0, len(pages), 50):              # Typesense: at most 50 searches per multi_search
-        docs += [d for batch in msearch(pages[i:i + 50]) for d in batch]
+        docs += [d for batch in msearch(pages[i:i + 50], bulk_client) for d in batch]
     return docs
 
 
@@ -573,7 +576,8 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                                  num_typos=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=10))
             keys.append("intent_titles")
     amb_ids = []
-    all_text = (p.get("entity") or nq) if not anchor and p["rule"] == "ambiguous"         and ("scope" not in p or p.get("entity")) else None   # one text, still ambiguous: every match is listed
+    all_text = (p.get("entity") or nq) if not anchor and p["rule"] == "ambiguous" \
+        and ("scope" not in p or p.get("entity")) else None   # one text, still ambiguous: every match is listed
     all_prods = (_all_product_hits(all_text) or hits) if all_text else []
     cmp_text = all_text if "compare" not in keys else None
     if not anchor and p["rule"] == "ambiguous" and "compare" not in keys and not cmp_text:
@@ -597,23 +601,30 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                                  **({"drop_tokens_threshold": 0} if p["intent"] else {})))
             keys.append(kind)
     uc_all = not anchor and p["rule"] == "ambiguous" and p["intent"] in (None, "compare") and not b
-    multi = len(nq.split()) >= 2                    # 'rev' while ambiguous: every use case it starts, below
-    if p["intent"] in (None, "compare") and not b and multi and p["rule"] not in ("exact", "parent"):
-        if not uc_all:
-            searches.append(use_case_search(nq, False))   # 'lead management automation': a use-case name
-            keys.append("use_case")
-        if semantic:                                # ... and, additionally, the closest meanings
+    multi = len(nq.split()) >= 2                    # 'rev' while ambiguous: every use case it starts, paged
+    if uc_all or p["intent"] in (None, "compare") and not b and multi and p["rule"] not in ("exact", "parent"):
+        searches.append({**use_case_search(nq, False), **({"per_page": PAGE_SIZE} if uc_all else {})})
+        keys.append("use_case")                     # 'lead management automation': a use-case name
+        if semantic and multi:                      # ... and, additionally, the closest meanings
             searches.append(use_case_search(nq, True))
             keys.append("use_case_sem")
-    got = dict(zip(keys, msearch(searches)))
+    cmp_pids = [h["product_ids"][0] for h in all_prods] if cmp_text else []
+    if cmp_pids:                                    # how many comparisons all the matching products have
+        searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:[{','.join(map(str, cmp_pids))}]",
+                             per_page=1, include_fields="id"))
+        keys.append("compare_count")
+    results = _perform(searches)
+    got = {k: [h["document"] for h in r["hits"]] for k, r in zip(keys, results)}
+    found = {k: r["found"] for k, r in zip(keys, results)}
+    got.pop("compare_count", None)
+    paging = {}                                     # ambiguous lists: page 1 now, the rest on scroll (/api/more)
     if uc_all:
-        got["use_case"] = msearch_all(use_case_search(nq, False))
-    if cmp_text:                                    # in the product list's order, most popular first per product
-        rank = {h["product_ids"][0]: i for i, h in enumerate(all_prods)}
-        got["compare"] = sorted(msearch_all(dict(q=cmp_text, query_by="product_names", filter_by="type:=compare",
-                                                 prefix=True, num_typos=0, drop_tokens_threshold=0,
-                                                 max_candidates=MAX_CANDIDATES, sort_by="popularity:desc")),
-                                key=lambda d: min(rank.get(i, len(rank)) for i in d["product_ids"]))
+        paging["use_case"] = {"total": found["use_case"],
+                              "next": {"kind": "use_case", "q": nq, "page": 2} if found["use_case"] > PAGE_SIZE else None}
+    if cmp_pids:                                    # in the product list's order, most popular first per product
+        got["compare"] = compare_chunk(cmp_pids[:COMPARE_CHUNK])
+        paging["compare"] = {"total": found["compare_count"],
+                             "next": {"kind": "compare", "offset": COMPARE_CHUNK} if len(cmp_pids) > COMPARE_CHUNK else None}
     if anchor and got.get("compare"):
         got["compare"] = _same_category_compares(anchor, got["compare"])[:COMPARES_SHOWN]
     for key, prod in (("compare_a", anchor), ("compare_b", b)):
@@ -656,8 +667,8 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                 first.setdefault(norm(x["title"]), x)
             items = list(first.values())[:USE_CASES_CAP]
         got["use_cases"] = items
-    kw = sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))   # names starting with the query first
-    kw = kw if uc_all else kw[:5]
+    kw = got.get("use_case", []) if uc_all else \
+        sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))[:5]   # names starting with the query first
     sem = uc_sem[:5]                                # closest meaning first, as returned
     seen, uc = set(), []
     for d in kw + sem:                              # keyword hits, then semantic ones; one per name
@@ -734,10 +745,29 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         "category_exact": category_exact,          # a category named exactly as the query
         "use_cases_semantic": any(norm(d["title"]) in sem_titles for d in uc),   # some use cases matched by meaning, not words
         "sections": [
-            {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]]}
+            {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]], **paging.get(k, {})}
             for k in order if sections.get(k)
         ],
     }
+
+
+def compare_chunk(pids: list[int]) -> list[dict]:
+    """The comparisons of these products, in their order (most popular first per product)."""
+    if not pids:
+        return []
+    rank = {pid: i for i, pid in enumerate(pids)}
+    docs = msearch_all(dict(q="*", filter_by=f"type:=compare && product_ids:[{','.join(map(str, pids))}]",
+                            sort_by="popularity:desc"))
+    return sorted(docs, key=lambda d: min(rank.get(i, len(rank)) for i in d["product_ids"]))
+
+
+def more(kind: str, q: str = "", page: int = 2, pids: list[int] = ()) -> dict:
+    """The next page of an ambiguous query's list: use cases by page, comparisons by products."""
+    if kind == "use_case":
+        res = _perform([{**use_case_search(norm(q), False), "per_page": PAGE_SIZE, "page": page}], bulk_client)[0]
+        return {"items": [_item(h["document"]) for h in res["hits"]],
+                "next": {"kind": "use_case", "q": q, "page": page + 1} if page * PAGE_SIZE < res["found"] else None}
+    return {"items": [_item(d) for d in compare_chunk(list(pids))]}
 
 
 def _all_docs(filter_by: str, **kw) -> list[dict]:

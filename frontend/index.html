@@ -28,6 +28,7 @@
          display:flex; flex-direction:column; overflow:hidden; min-width:0; }
   .box h2 { font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
             margin:0; padding:10px 14px; border-bottom:1px solid var(--line); flex:none; }
+  .box h2 .count { font-weight:400; letter-spacing:0; margin-left:6px; }
   .items { overflow-y:auto; flex:1; }
   .item { display:block; padding:9px 14px; text-decoration:none; color:inherit;
           border-bottom:1px solid var(--line); cursor:pointer; }
@@ -84,6 +85,7 @@ let lastSearch = null;          // latest /api/search response
 let detail = null;              // hovered product's /api/product/{pid} response
 let activePid = null;
 const detailCache = {};
+const loading = new Set();      // section keys whose next page is being fetched
 
 $q.addEventListener("input", () => {
   clearTimeout(timer);
@@ -97,7 +99,7 @@ async function search(q) {
   try {
     const res = await fetch(API_BASE + "/api/search?q=" + encodeURIComponent(q), { signal: controller.signal });
     if (res.status === 503) timer = setTimeout(() => search($q.value), 5000);   // cold start: retry while loading
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    if (!res.ok) throw new Error(await res.json().then(b => b.detail, () => null) || `${res.status} ${res.statusText}`);
     lastSearch = await res.json();
     detail = null; activePid = null;
     renderMeta(lastSearch);
@@ -149,12 +151,65 @@ function sectionItems(sections, key) {
 function columnsFor(sections) {
   return GROUPS.map(g => {
     const items = [];
-    for (const k of g.keys)
-      for (const it of sectionItems(sections, k))
-        items.push({ ...it, tag: TAG[k] });
-    return { title: g.title, items };
+    let total = 0, paged = null;
+    for (const k of g.keys) {
+      const sec = sections.find(s => s.key === k);
+      if (!sec) continue;
+      for (const it of sec.items) items.push({ ...it, tag: TAG[k] });
+      total += Math.max(sec.total ?? 0, sec.items.length);
+      if (sec.next) paged = k;                    // more pages of this section load on scroll
+    }
+    return { title: g.title, items, total, paged };
   });
 }
+
+// ---- more on scroll: the rest of an ambiguous search's use cases / comparisons ----
+async function loadMore(key) {
+  const data = lastSearch, sec = data?.sections.find(s => s.key === key);
+  if (detail || !sec?.next || loading.has(key)) return;
+  loading.add(key);
+  try {
+    const n = sec.next;
+    let items = [], next = null;
+    if (n.kind === "use_case") {
+      const r = await getJSON(`/api/more?kind=use_case&q=${encodeURIComponent(n.q)}&page=${n.page}`);
+      items = r.items; next = r.next;
+    } else {                                      // comparisons: of the next few products, in list order
+      const pids = sectionItems(data.sections, "products").map(it => it.pid).filter(Boolean);
+      let offset = n.offset;
+      const seen = new Set(sec.items.map(it => it.url));
+      while (offset < pids.length && !items.length) {
+        const r = await getJSON(`/api/more?kind=compare&pids=${pids.slice(offset, offset + 5).join(",")}`);
+        items = r.items.filter(it => !seen.has(it.url));   // a pair of two listed products: shown once
+        offset += 5;
+      }
+      next = offset < pids.length ? { kind: "compare", offset } : null;
+    }
+    if (lastSearch !== data) return;              // a new search started meanwhile
+    const have = new Set(sec.items.map(it => key === "use_case" ? it.title.toLowerCase() : it.url));
+    sec.items.push(...items.filter(it => !have.has(key === "use_case" ? it.title.toLowerCase() : it.url)));
+    sec.next = next;
+  } catch (e) {
+    console.warn("load more failed", e);
+    return;
+  } finally {
+    loading.delete(key);
+  }
+  renderBoard();
+}
+
+async function getJSON(path) {
+  const res = await fetch(API_BASE + path);
+  if (!res.ok) throw new Error(await res.json().then(b => b.detail, () => null) || `${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+function nearBottom(list) { return list.scrollTop + list.clientHeight >= list.scrollHeight - 300; }
+
+$board.addEventListener("scroll", e => {         // scroll does not bubble: listen in the capture phase
+  const list = e.target.closest?.(".items[data-paged]");
+  if (list && nearBottom(list)) loadMore(list.dataset.paged);
+}, true);
 
 function renderMeta(data) {
   const parts = [];
@@ -170,10 +225,10 @@ function renderMeta(data) {
 function renderBoard() {
   if (!lastSearch) return;
   const scrolls = {};
-  $board.querySelectorAll(".box").forEach(b =>
-    scrolls[b.querySelector("h2").textContent] = b.querySelector(".items").scrollTop);
+  $board.querySelectorAll(".box").forEach(b => scrolls[b.dataset.col] = b.querySelector(".items").scrollTop);
+  const products = sectionItems(lastSearch.sections, "products");   // kept while hovering
   const cols = columnsFor(detail ? detail.sections : lastSearch.sections)
-    .map((c, i) => i === 0 ? { ...c, items: sectionItems(lastSearch.sections, "products") } : c)
+    .map((c, i) => i === 0 ? { ...c, items: products, total: products.length, paged: null } : c)
     .filter(c => c.items.length);                                   // no empty boxes
   if (!cols.length) {
     $board.replaceChildren(el("div", "empty", "No results"));
@@ -181,8 +236,12 @@ function renderBoard() {
   }
   $board.replaceChildren(...cols.map(col => {
     const box = el("div", "box");
-    box.append(el("h2", "", col.title));
+    box.dataset.col = col.title;
+    const h2 = el("h2", "", col.title);
+    h2.append(el("span", "count", col.total.toLocaleString()));
+    box.append(h2);
     const list = el("div", "items");
+    if (col.paged && !detail) list.dataset.paged = col.paged;
     if (!col.items.length) list.append(el("div", "none", "—"));
     col.items.forEach(it => {
       const a = el("a", "item"); a.href = it.url; a.target = "_blank"; a.rel = "noopener";
@@ -193,11 +252,14 @@ function renderBoard() {
       a.append(title, el("div", "path", it.path));
       list.append(a);
     });
+    if (list.dataset.paged) list.append(el("div", "none", "Loading more…"));
     box.append(list);
     return box;
   }));
-  $board.querySelectorAll(".box").forEach(b =>
-    b.querySelector(".items").scrollTop = scrolls[b.querySelector("h2").textContent] || 0);
+  $board.querySelectorAll(".box").forEach(b => b.querySelector(".items").scrollTop = scrolls[b.dataset.col] || 0);
+  $board.querySelectorAll(".items[data-paged]").forEach(list => {   // not filled yet / still at the end: next page
+    if (nearBottom(list)) loadMore(list.dataset.paged);
+  });
   highlightActive();
 }
 
