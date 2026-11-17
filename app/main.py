@@ -31,6 +31,17 @@ def health():
     return {"api": "ok", "typesense": {"ok": True}}
 
 
+@app.get("/api/product/{pid}")
+def api_product(pid: int):
+    """One product's panels for the UI: category, use cases, news, stories, alternatives, comparisons."""
+    try:
+        return search.product_panels(pid)
+    except KeyError:
+        raise HTTPException(404, f"Product not found: {pid}")
+    except (TypesenseClientError, RuntimeError) as e:
+        raise HTTPException(503, f"Typesense error: {e}")
+
+
 @app.get("/api/collections")
 def api_collections():
     """The index builds (newest first) and the one search uses; any can be searched with ?collection=."""

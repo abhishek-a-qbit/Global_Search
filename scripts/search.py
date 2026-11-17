@@ -12,6 +12,7 @@ MIN_CHARS = 2
 MAX_SPLIT_TOKENS = 6
 MAX_EXTRACT_TOKENS = 8
 MAX_SPAN_TOKENS = 4
+MAX_CANDIDATES = 10000      # words a prefix expands to; Typesense's default 4 drops rarer ones ('soc' -> no 'Socialflow')
 client = make_client(timeout_seconds=2)             # search-as-you-type: fail fast
 COLLECTION = contextvars.ContextVar("collection", default=ALIAS)   # per request: the alias, or a build to compare
 
@@ -63,7 +64,8 @@ def use_case_search(nq: str, semantic: bool = SEMANTIC_USE_CASES) -> dict:
         return dict(q=nq, query_by="embedding", filter_by="type:=use_case", per_page=20,
                     vector_query=f"embedding:([], distance_threshold: {SEMANTIC_MAX_DISTANCE})")
     return dict(q=nq, query_by="title", filter_by="type:=use_case", prefix=True, num_typos=0,
-                drop_tokens_threshold=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=20)
+                drop_tokens_threshold=0, max_candidates=MAX_CANDIDATES,
+                sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=20)
 
 
 def is_use_case_name(nq: str) -> bool:
@@ -73,17 +75,29 @@ def is_use_case_name(nq: str) -> bool:
     return any(norm(d["title"]) == nq for d in hits)
 
 
-def msearch(searches: list[dict]) -> list[list[dict]]:
+def _perform(searches: list[dict]) -> list[dict]:
     if not searches:
         return []
     response = client.multi_search.perform({"searches": [{"collection": COLLECTION.get(), "exclude_fields": HEAVY_FIELDS, **s}
                                                          for s in searches]})   # long lists: fetched only when shown
-    out = []
     for res in response["results"]:
         if "error" in res:
             raise RuntimeError(res["error"])
-        out.append([h["document"] for h in res["hits"]])
-    return out
+    return response["results"]
+
+
+def msearch(searches: list[dict]) -> list[list[dict]]:
+    return [[h["document"] for h in res["hits"]] for res in _perform(searches)]
+
+
+def msearch_all(search: dict) -> list[dict]:
+    """Every hit of one search: page 1, then all other pages in one round trip."""
+    first = _perform([{**search, "per_page": 250, "page": 1}])[0]
+    docs = [h["document"] for h in first["hits"]]
+    pages = [{**search, "per_page": 250, "page": i} for i in range(2, -(-first["found"] // 250) + 1)]
+    for i in range(0, len(pages), 50):              # Typesense: at most 50 searches per multi_search
+        docs += [d for batch in msearch(pages[i:i + 50]) for d in batch]
+    return docs
 
 
 # ---- intent parsing ---------------------------------------------------------
@@ -164,12 +178,19 @@ def _product_queries(nq: str, typos: int) -> list[dict]:
     """Best text matches + most popular matches: Typesense ranks a whole-word hit ('Zed Sales')
     above a prefix hit ('Salesforce'), so popular prefix matches need their own pool."""
     base = dict(q=nq, query_by="product_names", filter_by="type:=product", prefix=True,
-                num_typos=typos, drop_tokens_threshold=0)
+                num_typos=typos, drop_tokens_threshold=0, max_candidates=MAX_CANDIDATES)
     return [
         dict(base, prioritize_exact_match=True, prioritize_token_position=True,
              sort_by="_text_match(buckets: 3):desc,name_len:asc,popularity:desc", per_page=TEXT_POOL),
         dict(base, sort_by="popularity:desc", per_page=POPULAR_POOL),
     ]
+
+
+def _all_product_hits(nq: str) -> list[dict]:
+    """Every product the text matches (prefix, no typos): the list shown while it is ambiguous."""
+    return rank_products(nq, msearch_all(dict(q=nq, query_by="product_names", filter_by="type:=product",
+                                              prefix=True, num_typos=0, drop_tokens_threshold=0,
+                                              max_candidates=MAX_CANDIDATES, sort_by="popularity:desc")))
 
 
 def match_tier(name: str, nq: str) -> int:
@@ -412,7 +433,10 @@ def interpret(nq: str) -> dict:
 
 # ---- stage 2: grouped results ----------------------------------------------
 def _item(d: dict) -> dict:
-    return {"title": d["title"], "path": d["path"], "url": BASE + d["path"], "type": d["type"]}
+    it = {"title": d["title"], "path": d["path"], "url": BASE + d["path"], "type": d["type"]}
+    if d["type"] == "product" and d.get("product_ids"):
+        it["pid"] = d["product_ids"][0]
+    return it
 
 
 def _dedupe(docs):
@@ -549,7 +573,10 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                                  num_typos=0, sort_by="_text_match(buckets: 3):desc,popularity:desc", per_page=10))
             keys.append("intent_titles")
     amb_ids = []
-    if not anchor and p["rule"] == "ambiguous" and "compare" not in keys:
+    all_text = (p.get("entity") or nq) if not anchor and p["rule"] == "ambiguous"         and ("scope" not in p or p.get("entity")) else None   # one text, still ambiguous: every match is listed
+    all_prods = (_all_product_hits(all_text) or hits) if all_text else []
+    cmp_text = all_text if "compare" not in keys else None
+    if not anchor and p["rule"] == "ambiguous" and "compare" not in keys and not cmp_text:
         amb_ids = [h["product_ids"][0] for h in hits[:5] if h.get("product_ids")]   # the candidates' comparisons
         for pid in amb_ids:                        # one search each: mixed below, not one product dominating
             searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:={pid}",
@@ -569,13 +596,24 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                                  **({"sort_by": "_text_match:desc,name_len:asc"} if short else {}),
                                  **({"drop_tokens_threshold": 0} if p["intent"] else {})))
             keys.append(kind)
-    if p["intent"] in (None, "compare") and not b and len(nq.split()) >= 2 and p["rule"] not in ("exact", "parent"):
-        searches.append(use_case_search(nq, False))   # 'lead management automation': a use-case name
-        keys.append("use_case")
+    uc_all = not anchor and p["rule"] == "ambiguous" and p["intent"] in (None, "compare") and not b
+    multi = len(nq.split()) >= 2                    # 'rev' while ambiguous: every use case it starts, below
+    if p["intent"] in (None, "compare") and not b and multi and p["rule"] not in ("exact", "parent"):
+        if not uc_all:
+            searches.append(use_case_search(nq, False))   # 'lead management automation': a use-case name
+            keys.append("use_case")
         if semantic:                                # ... and, additionally, the closest meanings
             searches.append(use_case_search(nq, True))
             keys.append("use_case_sem")
     got = dict(zip(keys, msearch(searches)))
+    if uc_all:
+        got["use_case"] = msearch_all(use_case_search(nq, False))
+    if cmp_text:                                    # in the product list's order, most popular first per product
+        rank = {h["product_ids"][0]: i for i, h in enumerate(all_prods)}
+        got["compare"] = sorted(msearch_all(dict(q=cmp_text, query_by="product_names", filter_by="type:=compare",
+                                                 prefix=True, num_typos=0, drop_tokens_threshold=0,
+                                                 max_candidates=MAX_CANDIDATES, sort_by="popularity:desc")),
+                                key=lambda d: min(rank.get(i, len(rank)) for i in d["product_ids"]))
     if anchor and got.get("compare"):
         got["compare"] = _same_category_compares(anchor, got["compare"])[:COMPARES_SHOWN]
     for key, prod in (("compare_a", anchor), ("compare_b", b)):
@@ -618,14 +656,15 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                 first.setdefault(norm(x["title"]), x)
             items = list(first.values())[:USE_CASES_CAP]
         got["use_cases"] = items
-    kw = sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))[:5]   # names starting with the query first
+    kw = sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))   # names starting with the query first
+    kw = kw if uc_all else kw[:5]
     sem = uc_sem[:5]                                # closest meaning first, as returned
     seen, uc = set(), []
     for d in kw + sem:                              # keyword hits, then semantic ones; one per name
         if norm(d["title"]) not in seen:
             seen.add(norm(d["title"]))
             uc.append(d)
-    uc = uc[:USE_CASES_CAP]
+    uc = uc if uc_all else uc[:USE_CASES_CAP]
     got["use_case"] = uc
     if uc:                                          # use cases matching the query win over a product's own
         got.pop("use_cases", None)
@@ -673,7 +712,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             seen = {h["id"] for h in prods}
             prods += [h for h in p.get("e2_hits", []) if h["id"] not in seen][:5]
     else:
-        prods = hits[:5]
+        prods = all_prods or (hits if p["rule"] == "ambiguous" else hits[:5])   # ambiguous: every product it matches
     sections = {"products": prods, **got}
 
     order = ["products", "category", *PRODUCT_PAGE_TYPES, "compare", "industry", "use_case"]
@@ -696,6 +735,47 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         "use_cases_semantic": any(norm(d["title"]) in sem_titles for d in uc),   # some use cases matched by meaning, not words
         "sections": [
             {"key": k, "label": SECTION_LABELS[k], "items": [_item(d) for d in sections[k]]}
+            for k in order if sections.get(k)
+        ],
+    }
+
+
+def _all_docs(filter_by: str, **kw) -> list[dict]:
+    """Every doc matching filter_by."""
+    return msearch_all(dict(q="*", filter_by=filter_by, **kw))
+
+
+def product_panels(pid: int) -> dict:
+    """Everything the UI shows for one product on hover: its category, use cases and pages
+    (news, customer stories, alternatives, comparisons). Raises KeyError when unknown."""
+    prods = msearch([dict(q="*", filter_by=f"type:=product && product_ids:={pid}", per_page=1)])[0]
+    if not prods:
+        raise KeyError(pid)
+    d = prods[0]
+    got = {}
+    for kind in ("news", "customer_story", "alternatives", "use_cases"):
+        kw = {"exclude_fields": "use_case_text,embedding,use_case_ids"} if kind == "use_cases" else {}
+        got[kind] = _all_docs(f"type:={kind} && product_ids:={pid}", **kw)
+        if kind in VENDOR_PAGE_TYPES:                        # vendor-level pages, like _run
+            vendor = msearch([dict(q=norm(d["product_names"][0]).split()[0], query_by="title",
+                                   filter_by=f"type:={kind}", num_typos=0, prefix=False, per_page=250)])[0]
+            got[kind] = _dedupe(got[kind] + [v for v in vendor
+                                            if _vendor_of(v, kind, norm(d["product_names"][0]))])
+    compares = _all_docs(f"type:=compare && product_ids:={pid}", sort_by="popularity:desc")
+    same = _same_category_compares(d, compares)     # same category first, then all the others
+    got["compare"] = _dedupe(same + compares)
+    names = got.pop("use_cases")
+    got["use_cases"] = [{"id": f"{u['id']}-{k}", "path": u["path"], "type": "use_case", "title": name}
+                        for u in names for k, name in enumerate(u.get("use_case_names", []))]
+    cat = [{"id": d["category_id"], "title": d["category_title"], "path": d["category_path"],
+            "type": "category"}] if d.get("category_id") else []
+    sections = {"category": cat, **got}
+    order = ["category", "use_cases", "news", "customer_story", "alternatives", "compare"]
+    return {
+        "pid": pid,
+        "name": d["title"],
+        "sections": [
+            {"key": k, "label": SECTION_LABELS[k], "items": [_item(x) for x in sections[k]]}
             for k in order if sections.get(k)
         ],
     }
