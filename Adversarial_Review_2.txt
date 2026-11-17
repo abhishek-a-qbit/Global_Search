@@ -1,0 +1,182 @@
+ADVERSARIAL REVIEW #2 - Cuspera search
+======================================
+
+Date:      5 Nov 2026
+Branch:    jsonL-sync
+Compared:  the code from before today (11edd77)  vs  today's two commits (2be64ce, 5ef3cbf)
+           (same code as review #1 - none of the review #1 fixes were applied)
+
+THE SHORT VERSION
+-----------------
+New test searches, plus the stuff review #1 skipped (server errors, many searches at once,
+semantic search on/off, bad API inputs).
+
+- Today's changes: 1 real problem. Searches typed as a sentence ("find out which companies
+  visit my site") now get a pile of unrelated news and use cases on top of the right answer.
+- Older problems (not caused by today): 2 important ones.
+    * About half the products with (R) or (TM) in the middle of their name can't be found by
+      typing their name.
+    * When the search engine is down, the site shows "Internal Server Error" instead of a
+      friendly "search is unavailable" message.
+- Everything else held up: no crashes, same results every time, no mix-ups under load.
+- No code was changed during the review.
+
+
+HOW THIS REVIEW WAS DIFFERENT FROM #1
+-------------------------------------
+Review #1 picked products from the 1,000 most popular ones and mostly tried vague searches.
+This time:
+- Products were picked from the whole catalog (all 11,853), including very unpopular ones.
+- New kinds of searches (555 in total, different random seed):
+    * the same search typed differently: "CRM", "  crm  ", "Crm", "crm?", "crm  software"
+    * the first 3-5 letters of unpopular products
+    * products whose names contain words like "and", "or", "news", "vs", "compare"
+      (e.g. "SAS OR Software") - these could confuse the keyword detection
+    * products named like everyday words: "box", "monday", "slack", "close", "copper", "notion"
+    * sentence-style searches: "best crm for small business", "alternatives to salesforce",
+      "hubspot news and alternatives", "slack vs teams vs zoom", "what is crm"
+    * hacker-style / junk input: "<script>", "' or 1=1", "type:=product", "*", "%",
+      invisible characters, tabs, new lines, a null byte, "c++", "o'reilly", "e-mail"
+- Typing a product's full name letter by letter (40 random products), checking when it appears.
+- Semantic (meaning-based) search switched on vs off, on 89 searches.
+- Bad inputs sent straight to the API (too long, wrong values, unknown index names).
+- 200 searches fired at the API at once (20 at a time).
+- Pretending the search engine (Typesense) is down, not answering, or half-failing.
+
+
+THE GOOD NEWS
+-------------
+- Zero crashes on all 555 searches, including the junk / hacker-style ones.
+- Same search twice = same result, every time (555 out of 555).
+- The same search typed differently ("CRM" vs " crm " vs "Crm?") always gives exactly the same
+  result (252 out of 252).
+- Bad API input is handled properly:
+    * over 200 characters -> rejected with a clear message (422)
+    * semantic=abc -> rejected (422)
+    * a made-up index name -> rejected (422), an unknown index build -> "not found" (404)
+- Websites other than ours can't call the API from a browser (CORS check rejects them).
+- 200 searches at once: all succeeded, all returned the right results, nothing got mixed up
+  between people searching at the same time. Typical response about 0.1 s, slowest 0.5 s
+  (this was the local dev server, which runs on a single process).
+- Searching an older copy of the index (?collection=) never "leaked" into other people's
+  searches running at the same time.
+- If one part of a search fails, the user gets a clean "search error" message, not a crash.
+- Semantic search on/off never changes the extra news / stories / use cases for the top 2
+  products, which is what we want.
+- Product names from the catalog can't inject HTML into the page (the page inserts them as
+  plain text).
+
+
+PROBLEMS CAUSED BY TODAY'S CHANGES
+----------------------------------
+1. Sentence-style searches get buried under unrelated extras   (medium-high)
+   - When a search reads like a sentence, some of its words loosely match product names, so it
+     counts as "vague". The new "top 2 products' extras" then kick in for those loose matches.
+   - The right answer (matching use cases) ends up at the very bottom, under stuff that has
+     nothing to do with the search.
+   - Examples:
+       "find out which companies visit my site"
+          before: products, then "Website visitor identification" use cases (the right answer)
+          now:    + OutSystems News, Stories, Alternatives, and "Legacy system modernization"
+                    use cases, all above the right answer
+       "track my sales team"   -> + TRACK CRM "property management" use cases
+       "send emails automatically" -> + SendX "email deliverability" use cases
+   - Why review #1 missed it: the guard only kicks in when a use case name *starts with* the
+     search ("sales pipeline management"), not when it just matches the meaning or some words.
+   - Fix: if the search already matches use-case names, don't add the top-2 extras at all.
+     This also fixes review #1's problem #2 (two "Use cases" headings).
+
+2. The 5-product limit hides some products that are already hard to find   (medium)
+   - This is a side effect of the older problem A below.
+   - Of the 69 products that don't come up as the match when you type their name, the old long
+     list still showed 61 of them somewhere. The 5-product list shows 52.
+   - Example: typing "sas or software" no longer lists SAS OR Software.
+   - Fix: fix problem A, and this mostly goes away.
+
+3. Two sections both called "Use cases" (same as review #1, problem #2)   (low-medium)
+   - Showed up again with the new searches (17 times, mostly the same product typed in
+     different ways). Fixed by the fix for #1 above.
+
+
+OLDER PROBLEMS (already there before today, but worth fixing)
+-------------------------------------------------------------
+A. Products with (R), (TM) or (C) in the middle of the name can't be found by name   (high)
+   - 137 product names have one of these symbols before another word, like
+     "SAS(R) Analytics for IoT" or "Demandbase One(TM) for Sales".
+   - For 69 of them (about half), typing the full name doesn't find that product as the match.
+   - Why: the search engine stores "SAS(R)" as one word, so typing "sas" doesn't match it.
+     Typing "sas credit assessment manager" finds nothing, even though that's exactly the name.
+   - Symbols at the END of a name are fine (60 out of 60 found).
+   - Fix: strip these symbols when building the index, or tell Typesense to treat them as word
+     breaks. Either way it needs one index rebuild.
+
+B. When the search engine is down, users see "Internal Server Error"   (medium)
+   - Expected: a 503 "search unavailable" message (and the page would retry by itself).
+   - Actual: a plain 500 "Internal Server Error" after waiting 6 seconds. /api/health also
+     gives 500 instead of 503.
+   - Why: when it can't connect, the search engine's Python library throws a network error
+     type that our code doesn't catch.
+   - Because of that, the page's "keep retrying while the index loads" logic never kicks in.
+   - Fix: also catch network errors in app/main.py (a couple of lines).
+   - The 6 seconds = a 2-second timeout tried 3 times. Could be shortened.
+
+C. One random search timeout (408) under load   (low)
+   - Happened once while other tests were running at the same time.
+   - Couldn't make it happen again: re-ran the same 40-product typing test and nothing took
+     longer than 0.5 s. Just keep an eye on it on the VM.
+
+D. Accented letters get dropped   (low)
+   - "café" is treated as "caf", so typing "cafe" doesn't find "Café".
+   - Only affects names with real accents (rare). (R)/(TM) at the end of a name are fine.
+
+E. Several keywords in one search confuse it   (low)
+   - "hubspot news and alternatives" treats "news" as the product NewsWhip and shows it.
+   - "salesforce news customer stories" and "news news" do the same.
+
+F. Slack shows CRM-type use cases   (low, probably data)
+   - "slack vs teams vs zoom" shows Slack with category CRM and the same use cases as
+     Salesforce CRM. Looks like a catalog data issue rather than code. Worth a look.
+
+G. Broken catalog data could crash a search   (info)
+   - If a product record were missing its popularity, a search would crash (500).
+   - The index setup requires popularity, so this shouldn't happen in practice.
+
+
+WHAT I'D DO NEXT
+----------------
+Quick, small code changes:
+1. Fix #1: no top-2 extras when the search matches use-case names
+   (also fixes the double "Use cases" heading, review #1 #2 and #3 here).
+2. Fix B: catch network errors so users get "search unavailable" and the page retries.
+3. Review #1 fixes #1 (one-letter categories) and #3 (no extras for "category").
+
+Needs an index rebuild:
+4. Fix A: make (R)/(TM)/(C) act as word breaks. This also mostly fixes #2.
+
+Then re-run reviews #1 and #2's tests to make sure nothing else changed.
+
+
+A NOTE ON SAFETY
+----------------
+- To check whether the catalog write API is switched on locally, I sent one "create product"
+  request for a product that already exists. It answered "already exists" (409), so nothing
+  was created or changed.
+- The write API is on by default when running locally and off in the Docker image (which is
+  what the Google Cloud VM uses).
+- All other tests only read data. The "search engine down" tests ran inside the test script
+  (pointing it at a fake address), so the real Typesense was never stopped.
+
+
+IDEAS FOR REVIEW #3
+-------------------
+- Test on the real Google Cloud VM: speed, the 408 timeout, cold start after a restart.
+- Edits through the catalog API while people are searching (rename a product, delete one,
+  add a use case) and check results update and nothing breaks.
+- Typing speed: the page sends a search on almost every key press - check old, slow answers
+  never overwrite newer ones.
+- Real search logs, if there are any, instead of made-up searches.
+- After the fixes above: re-run reviews #1 and #2.
+
+(Test details for repeating this: random seed 11; catalog of 11,853 products; concurrency test
+ = 200 requests, 20 at a time, against the local dev server; "engine down" = client pointed at
+ 127.0.0.1:1 and 10.255.255.1:8108 with the app's normal 2 s timeout.)

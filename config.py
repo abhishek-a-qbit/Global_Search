@@ -1,7 +1,15 @@
 import os
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import typesense
+
+_env = Path(__file__).with_name(".env")          # local overrides; gitignored, absent in Docker images
+if _env.exists():
+    for _line in _env.read_text(encoding="utf-8").splitlines():
+        if "=" in _line and not _line.lstrip().startswith("#"):
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 TS_URL = os.getenv("TYPESENSE_URL", "http://127.0.0.1:8108")   # not "localhost": avoids a slow IPv6 attempt on Windows
 TS_KEY = os.getenv("TYPESENSE_API_KEY", "xyz")

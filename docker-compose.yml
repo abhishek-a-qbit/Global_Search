@@ -24,6 +24,7 @@ services:
     environment:
       TYPESENSE_URL: http://typesense:8108
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-xyz}
+      SOURCE_URL: ${SOURCE_URL:-data/catalog.jsonl.gz}
       WATCHFILES_FORCE_POLLING: "true"     # file events do not cross a Windows bind mount
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --reload-dir scripts

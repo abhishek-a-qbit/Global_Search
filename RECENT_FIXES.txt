@@ -1,0 +1,137 @@
+GLOBAL SEARCH - RECENT BUG FIXES
+=================================
+
+A plain-language list of the search bugs fixed in the recent
+jsonL-sync work, with the commit that fixed each one.
+
+
+1. AMBIGUOUS SEARCHES ONLY SHOWED PARTIAL RESULTS
+-------------------------------------------------
+Query example: zoom
+
+Bug:   When a query matched several products (ambiguous), the engine
+       only looked at the top 2 candidates. Result: only 1 category,
+       few news pages, and comparison results all came from a single
+       product.
+Fix:   Ambiguous searches now consider the top 5 candidate products
+       and gather related content (categories, news, customer stories,
+       alternatives, use cases, comparisons) for all of them.
+Commit: e1fbe90 - ambiguous queries cover all five candidates.
+
+
+2. COMPARISON RESULTS FOR AMBIGUOUS QUERIES WERE ONE-SIDED
+-----------------------------------------------------------
+Query example: zoom, sap
+
+Bug:   All comparison links came from whichever candidate happened to
+       be most popular overall, ignoring the other candidates.
+Fix:   Comparisons are now collected per candidate, prefer products
+       in the same category, and are merged round-robin so the list is
+       diverse (up to 5).
+Commit: e1fbe90.
+
+
+3. WRONG CATEGORY SOURCE FOR PRODUCTS
+-------------------------------------
+
+Bug:   Two different files were used to decide a product's main
+       category: the search index used product_categories.json, but
+       the catalog API used the legacy "cat" field inside prod.json.
+       They disagreed, so "same-category" comparison grouping was
+       inconsistent.
+Fix:   product_categories.json is now the single source of truth
+       everywhere (via the product's category_link).
+Commit: 1395e88.
+
+
+4. PRODUCT NAMES CAME FROM STALE DATA
+-------------------------------------
+Query example: meritto
+
+Bug:   Product names were taken from prod.json, which was outdated.
+       The Meritto product page was indexed under the name
+       "NoPaperForms", so searching "meritto" found nothing useful.
+Fix:   The indexer no longer reads prod.json at all. Product names
+       are derived from the sitemap URL slugs (meritto-x-19367 ->
+       "Meritto"), with categories from product_categories.json and
+       use cases from product_usecases.json. The whole Typesense
+       index was rebuilt (358,864 docs).
+Commit: 262d132.
+
+Side effect (accepted): some names now have slug-style casing, e.g.
+"Adobe Acrobat Dc", "Zoominfo Inboxai". Connector words
+(and/with/for) were fixed to stay lowercase.
+
+
+5. EXACT/PARENT SEARCHES SHOWED UNRELATED EXTRA PRODUCTS
+---------------------------------------------------------
+Query examples: canva, salesforce, zoomin software
+
+Bug:   A confident match still listed up to 3 products, and generic
+       words in the query pulled in unrelated categories (e.g.
+       "zoomin software" showed every category containing "software").
+Fix:   Exact and parent matches now show only the anchor product.
+       Dominant matches still show up to 3 (the guess might be wrong,
+       so alternates remain visible). Ambiguous searches still show
+       5. Category/industry title searches are skipped when a
+       confident product anchor exists.
+Commits: e59a64b, plus the anchored-category fix.
+
+
+6. BRAND QUERIES WERE PINNED TO ONE PRODUCT
+-------------------------------------------
+Query examples: adobe, salesforce, sap
+
+Bug:   Any set of products sharing a name prefix was treated as one
+       "parent" family, so "adobe" resolved to a single product
+       (Adobe Acrobat) even though Adobe has many distinct products.
+Fix:   A shared prefix is only a parent match when the top product is
+       at least 3x more popular than the next one (a real family like
+       "demandbase"). Otherwise the query is ambiguous and lists the
+       brand's products ranked by popularity. Since the
+       family-diversity grouping was removed earlier, ranking is now
+       pure popularity within each match tier.
+Commit: 7d640ac.
+
+
+7. COMPARISONS BROKE WHEN ONE SIDE WAS AMBIGUOUS
+------------------------------------------------
+Query example: salesforce vs hubspot
+
+Bug:   After fix #6, "salesforce" became ambiguous. In a "vs" query
+       the ambiguous side was dropped entirely, so comparison results
+       collapsed (only 1 weak page instead of "Hubspot CRM vs
+       Salesforce CRM" etc.).
+Fix:   An ambiguous side of a comparison now contributes its top
+       product as the comparison partner for finding compare pages,
+       while its candidate list is still shown in the Products
+       section.
+Commit: 7d640ac.
+
+
+8. SAME-BRAND PRODUCTS CROWDED OUT DIVERSITY (INTENTIONAL CHANGE)
+------------------------------------------------------------------
+Query examples: sap, zoom, sales
+
+Change (not strictly a bug): The old rule gave each brand's first
+product an early slot before that brand's second product - meant to
+diversify brands, but it promoted weak matches ("Sapien" ranked #2
+for "sap") and suppressed genuinely popular products.
+
+Decision: Removed. Product lists are now ranked by pure popularity
+(match quality -> popularity -> shorter name). Trade-off:
+brand-heavy queries like "zoom" can show several products from the
+same company.
+
+Commit: 83ced47.
+
+
+DATA/OPS NOTES
+--------------
+
+- data/catalog.jsonl.gz was regenerated from the rebuilt index so a
+  future sync won't restore old prod.json names.
+- prod.json is now unused - safe to delete.
+- Known data gaps (need upstream fixes, not code): some products have
+  no category mapping ("adobe" shows no Category section) and no use
+  cases ("meritto").

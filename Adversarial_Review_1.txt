@@ -1,0 +1,136 @@
+ADVERSARIAL REVIEW #1 - Cuspera search
+======================================
+
+Date:      5 Nov 2026
+Branch:    jsonL-sync
+Compared:  the code from before today (11edd77)  vs  today's two commits (2be64ce, 5ef3cbf)
+
+THE SHORT VERSION
+-----------------
+I tried hard to break today's search changes. Nothing crashed and nothing is badly broken.
+I found 3 small things worth fixing, plus 2 things worth knowing about. No code was changed
+during the review.
+
+
+WHAT CHANGED TODAY (the stuff being reviewed)
+---------------------------------------------
+1. Vague searches like "zoom" or "usecase cr" now show 5 products instead of a huge list
+   (it used to be up to ~50).
+2. Typing just 2 letters like "cr" now also shows matching categories, so "cr" shows CRM.
+3. Searches like "usecase crm" or "news crm" now show the CRM category too.
+4. Vague searches now also show news, customer stories, alternatives, use cases and the
+   category for the top 2 products in the list. This is skipped when the search is exactly
+   a category name ("crm", "banking") or a use-case name, because there the top 2 products
+   aren't really what the person is looking for.
+
+
+HOW I TESTED IT
+---------------
+- I ran 488 made-up searches through both the old code and the new code, side by side, on the
+  same data, and compared the results.
+- The searches were a mix of:
+    * the first few letters of product names ("sal", "zoo", "hubs")
+    * a keyword plus part of a name, both ways round ("news cr", "cr news", "usecase zo")
+    * category and industry names, and their first 2 letters
+    * use-case names ("lead management automation")
+    * comparisons ("canva vs fi", "outreach demandbase")
+    * deliberately weird stuff: empty searches, one letter, "news c", 200 characters,
+      "cr cr cr cr...", emoji-free unicode (Japanese, "café"), "!!", "@@ cr", "vs", "and",
+      "news usecase", "crm crm crm" and so on
+- For every result I checked some basic rules, like:
+    * it doesn't crash
+    * no two sections have the same heading
+    * no empty sections
+    * the extra news / stories / use cases really belong to the 2 products shown at the top
+    * the main section for a keyword (e.g. News for "news cr") hasn't changed
+- I also timed the searches (old vs new) to see if anything got slower.
+
+
+THE GOOD NEWS
+-------------
+- Zero crashes, even on the weird searches.
+- The extra news / stories / use cases always belonged to the right 2 products. Never wrong.
+- The main section for a keyword search ("news cr" -> News) stayed the same as before.
+- Where a product was clearly matched ("salesforce", "canva vs figma"), the only change was
+  the shorter product list we asked for. For example "cb vs co" used to list 40 products,
+  now 7.
+
+
+THINGS TO FIX
+-------------
+1. One letter after a keyword pulls in random categories   (medium)
+   - Search "news c" or "usecase c".
+   - It now shows categories CRM and CPQ, and industries Construction and Consumer Goods,
+     just because they start with "c".
+   - A plain search needs at least 2 letters, but this one doesn't check.
+   - Fix: only look for categories when there are at least 2 letters.
+
+2. Two sections both called "Use cases"   (low-medium)
+   - One is "use cases matching what you typed", the other is "use cases of the top products".
+     Both get the same heading, which looks confusing.
+   - This mostly happened before too (21 of 160 test searches before, 22 now). Today's change
+     just adds a few more, like "compare digital signage" and "crm crm crm".
+   - Fix: if use cases already match what you typed, don't add the top products' use cases.
+     (Or give the two sections different names.)
+
+3. The "category" keyword gets extras it doesn't need   (low)
+   - Search "category visitor management" or "sal category".
+   - You asked for categories, but it also shows news, stories and use cases for 2 products,
+     and adds those products' categories to the list (e.g. "Content Management Systems").
+   - Fix: don't add the top-2 extras when the keyword is "category".
+
+
+GOOD TO KNOW (not bugs)
+-----------------------
+4. Vague searches are a bit slower now
+   - Locally, the typical vague search went from about 8 ms to about 16 ms
+     (the slow ones: about 21 ms -> 28 ms).
+   - It's still one request to the search engine, it just asks for more things at once.
+   - Searches with a clear product match are just as fast as before.
+   - Worth checking the speed on the Google Cloud VM after deploying.
+
+5. Some comparisons still list 8 products, not 5
+   - Example: "cb vs co". It shows CB Insights + 2 more + up to 5 guesses for the "co" side.
+   - Much better than the 40 it used to show, but not exactly 5.
+   - Optional fix: cap that list at 5 in total.
+
+
+OLD PROBLEMS I NOTICED (already there before today, not caused by these changes)
+-------------------------------------------------------------------------------
+- "news usecase" shows nothing at all.
+- "crm crm crm" puts the CRM category last.
+- Some different use-case names link to the same page.
+- All of a product's use cases link to the same product page. That's on purpose.
+
+
+WHAT I'D DO NEXT
+----------------
+1. Fix #1 (one-letter categories)       - a one-line change
+2. Fix #2 (double "Use cases" heading)  - a couple of lines
+3. Fix #3 (extras on "category")         - a one-line change
+4. Maybe fix #5 (cap at 5)
+5. Re-run the same 488 searches to make sure the fixes didn't break anything,
+   and check the speed on the VM.
+
+Where things stand right now:
+- None of the fixes are done yet.
+- Today's changes (5ef3cbf) are pushed to jsonL-sync on GitHub and Bitbucket.
+- main hasn't been touched.
+- The Google Cloud VM hasn't been updated yet.
+
+
+NOTES FOR REVIEWS #2 AND #3
+---------------------------
+- Use the same "before" code (11edd77) and the same random test searches, so the three
+  reviews can be compared with each other. Add new kinds of searches rather than replacing
+  these.
+- Things this review didn't look at:
+    * semantic (meaning-based) use-case search switched on vs off
+    * searching an older copy of the index (?collection=)
+    * what happens if someone edits the catalog through the API while people are searching
+    * what happens if the search engine is slow, down, or half-fails
+    * lots of searches at the same time
+    * testing on the real Google Cloud VM
+
+(Test details for repeating this: random seeds 7 and 3; the timing test used 15 vague searches
+ x 5 rounds, warmed up, alternating old/new.)
