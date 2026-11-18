@@ -13,6 +13,9 @@ MAX_SPLIT_TOKENS = 6
 MAX_EXTRACT_TOKENS = 8
 MAX_SPAN_TOKENS = 4
 MAX_CANDIDATES = 10000      # words a prefix expands to; Typesense's default 4 drops rarer ones ('soc' -> no 'Socialflow')
+LIST_ALL = True             # no exact/parent/dominant collapse: while typing, the board always lists every
+                            # matching product, use case and comparison (continuity); only a clear
+                            # two-product comparison still resolves
 client = make_client(timeout_seconds=2)             # search-as-you-type: fail fast
 bulk_client = make_client(timeout_seconds=30)       # ... except the full lists of an ambiguous query (many pages)
 COLLECTION = contextvars.ContextVar("collection", default=ALIAS)   # per request: the alias, or a build to compare
@@ -536,19 +539,27 @@ def _run(q: str, semantic: bool | None = None) -> dict:
 
     p = interpret(nq)
     anchor, b, hits = p["anchor"], p.get("anchor2"), p["hits"]
+    if LIST_ALL and anchor and not p.get("pair") and not p.get("partners"):   # keep the candidate list
+        anchor, b = None, None
+        p = {k: v for k, v in p.items() if k not in ("e2", "e2_hits", "pair", "partners")}
+        p["rule"] = "ambiguous"
+        if p.get("intent"):                        # intent pages of the candidates, not the most popular overall
+            p["scope"] = list(dict.fromkeys(h["product_ids"][0] for h in hits if h.get("product_ids")))
 
     searches, keys = [], []
     focus = ([anchor] + ([b] if b else [])) if anchor else \
         hits[:AMBIGUOUS_FOCUS] if p["rule"] == "ambiguous" else []   # whose own pages are shown
     for i, prod in enumerate(focus):                # group info for both products / the top candidates
         for kind in PRODUCT_PAGE_TYPES:
-            if not anchor and kind == p["intent"]:  # 'news cr': already listed for every candidate
-                continue
-            names = kind == "use_cases"                                    # its use-case names: listed as links
-            searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={prod['product_ids'][0]}",
-                                 per_page=1, **({"exclude_fields": "use_case_text,embedding,use_case_ids"}
-                                                if names else {})))
-            keys.append(f"{kind}_{i}")
+            listed = not anchor and kind == p["intent"]                    # 'news cr': the intent search lists them
+            if listed and kind not in VENDOR_PAGE_TYPES:
+                continue                                                    # ... but vendor pages have no product_ids
+            if not listed:
+                names = kind == "use_cases"                                # its use-case names: listed as links
+                searches.append(dict(q="*", filter_by=f"type:={kind} && product_ids:={prod['product_ids'][0]}",
+                                     per_page=1, **({"exclude_fields": "use_case_text,embedding,use_case_ids"}
+                                                    if names else {})))
+                keys.append(f"{kind}_{i}")
             if kind in VENDOR_PAGE_TYPES:
                 searches.append(dict(q=norm(prod["product_names"][0]).split()[0], query_by="title",
                                      filter_by=f"type:={kind}", num_typos=0, prefix=False, per_page=10))
@@ -569,7 +580,8 @@ def _run(q: str, semantic: bool | None = None) -> dict:
         if scope or not entity:
             searches.append(dict(q="*", filter_by=f"type:={p['intent']}" + (
                 f" && product_ids:[{','.join(map(str, scope))}]" if scope else ""),
-                sort_by="popularity:desc", per_page=50 if scope else 5))
+                sort_by="popularity:desc", per_page=50 if scope else 5,
+                **({"exclude_fields": "use_case_text,embedding,use_case_ids"} if p["intent"] == "use_cases" else {})))
             keys.append(p["intent"])
         if entity:                                  # pages not tied to one product, e.g. '/vendors/salesforce/news'
             searches.append(dict(q=entity, query_by="title", filter_by=f"type:={p['intent']}", prefix=True,
@@ -600,15 +612,17 @@ def _run(q: str, semantic: bool | None = None) -> dict:
                                  **({"sort_by": "_text_match:desc,name_len:asc"} if short else {}),
                                  **({"drop_tokens_threshold": 0} if p["intent"] else {})))
             keys.append(kind)
-    uc_all = not anchor and p["rule"] == "ambiguous" and p["intent"] in (None, "compare") and not b
     multi = len(nq.split()) >= 2                    # 'rev' while ambiguous: every use case it starts, paged
-    if uc_all or p["intent"] in (None, "compare") and not b and multi and p["rule"] not in ("exact", "parent"):
-        searches.append({**use_case_search(nq, False), **({"per_page": PAGE_SIZE} if uc_all else {})})
+    uc_kw = p["intent"] in (None, "compare") and not b and (
+        not anchor and p["rule"] == "ambiguous" or multi and p["rule"] not in ("exact", "parent"))
+    if uc_kw:
+        searches.append({**use_case_search(nq, False), "per_page": PAGE_SIZE})
         keys.append("use_case")                     # 'lead management automation': a use-case name
         if semantic and multi:                      # ... and, additionally, the closest meanings
             searches.append(use_case_search(nq, True))
             keys.append("use_case_sem")
-    cmp_pids = [h["product_ids"][0] for h in all_prods] if cmp_text else []
+    cmp_pids = [h["product_ids"][0] for h in all_prods] if cmp_text else         ([h["product_ids"][0] for h in hits if h.get("product_ids")]
+         if p.get("intent") and not anchor and p["rule"] == "ambiguous" else [])   # intent: the candidates' comparisons
     if cmp_pids:                                    # how many comparisons all the matching products have
         searches.append(dict(q="*", filter_by=f"type:=compare && product_ids:[{','.join(map(str, cmp_pids))}]",
                              per_page=1, include_fields="id"))
@@ -618,7 +632,7 @@ def _run(q: str, semantic: bool | None = None) -> dict:
     found = {k: r["found"] for k, r in zip(keys, results)}
     got.pop("compare_count", None)
     paging = {}                                     # ambiguous lists: page 1 now, the rest on scroll (/api/more)
-    if uc_all:
+    if uc_kw:
         paging["use_case"] = {"total": found["use_case"],
                               "next": {"kind": "use_case", "q": nq, "page": 2} if found["use_case"] > PAGE_SIZE else None}
     if cmp_pids:                                    # in the product list's order, most popular first per product
@@ -654,28 +668,23 @@ def _run(q: str, semantic: bool | None = None) -> dict:
             if not own:                             # no page of its own: 'Demandbase One' -> Demandbase News
                 own = [d for d in vendor if _vendor_of(d, kind, norm(prod["product_names"][0]))][:1]
             got[kind] = _dedupe(got.get(kind, []) + own)[:5]   # two candidates may share a vendor page
-    if not anchor and p["intent"] != "use_cases":   # a product's own use cases: only for a confident product
-        got.pop("use_cases", None)
-    elif anchor:                                    # one link per name, to the product page's use-case section
-        shown = USE_CASES_SHOWN if p["intent"] == "use_cases" else USE_CASES_PREVIEW
+    if got.get("use_cases"):                        # the top candidates' use-case names, as links to their pages
         lists = [[{"id": f"{d['id']}-{k}", "path": d["path"], "type": "use_case", "title": name}
-                  for k, name in enumerate(d.get("use_case_names", [])[:shown])] for d in got.get("use_cases", [])]
-        items = [x for row in itertools.zip_longest(*lists) for x in row if x]   # 2 products: taking turns
-        if len(lists) > 1:                          # ... one per name, 6 in total
+                  for k, name in enumerate(d.get("use_case_names", []))] for d in got.get("use_cases", [])]
+        items = [x for row in itertools.zip_longest(*lists) for x in row if x]   # taking turns across products
+        if len(lists) > 1:                          # one per name
             first = {}
             for x in items:
                 first.setdefault(norm(x["title"]), x)
-            items = list(first.values())[:USE_CASES_CAP]
+            items = list(first.values())
         got["use_cases"] = items
-    kw = got.get("use_case", []) if uc_all else \
-        sorted(got.get("use_case", []), key=lambda d: -match_tier(norm(d["title"]), nq))[:5]   # names starting with the query first
-    sem = uc_sem[:5]                                # closest meaning first, as returned
+    kw = got.get("use_case", [])                   # keyword hits in Typesense order, paged like the products
+    sem = uc_sem                                    # closest meaning first, as returned
     seen, uc = set(), []
     for d in kw + sem:                              # keyword hits, then semantic ones; one per name
         if norm(d["title"]) not in seen:
             seen.add(norm(d["title"]))
             uc.append(d)
-    uc = uc if uc_all else uc[:USE_CASES_CAP]
     got["use_case"] = uc
     if uc:                                          # use cases matching the query win over a product's own
         got.pop("use_cases", None)
